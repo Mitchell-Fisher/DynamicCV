@@ -203,3 +203,4 @@ calibration_*.npy
 # Training logs
 args.yaml
 results.csv
+"runs/ datasets/ *.pt *.onnx *.engine *.tflite *torchscript wandb/ __pychache__/"
