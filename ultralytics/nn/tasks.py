@@ -45,6 +45,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    AuxDetect,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -97,7 +98,7 @@ from ultralytics.utils.torch_utils import (
     smart_inference_mode,
     time_sync,
 )
-
+from ultralytics.utils import nms
 
 class BaseModel(torch.nn.Module):
     """Base class for all YOLO models in the Ultralytics family.
@@ -173,6 +174,7 @@ class BaseModel(torch.nn.Module):
         y, dt, embeddings = [], [], []  # outputs
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
+        self.last_exit = "full"
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
@@ -186,6 +188,18 @@ class BaseModel(torch.nn.Module):
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
+            if (
+                not self.training
+                and getattr(self, "early_exit_enabled",False)
+                and isinstance(m, AuxDetect)
+            ):
+                person_conf = self._max_aux_person_score(x, self.exit_class_idx)
+                # print("AUX raw object score =", person_conf)
+                if person_conf >= self.exit_threshold:
+                    self.last_exit = "aux"
+                    return x[0] if isinstance(x, (tuple, list)) else x
+                # if isinstance(x, (tuple, list)) and len(x) > 1 and isinstance(x[1], dict):
+                    # print("AUX meta keys:", x[1].keys())
         return x
 
     def _predict_augment(self, x):
@@ -376,6 +390,7 @@ class DetectionModel(BaseModel):
             nc (int, optional): Number of classes.
             verbose (bool): Whether to display model information.
         """
+
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
         if self.yaml["backbone"][0][2] == "Silence":
@@ -421,6 +436,31 @@ class DetectionModel(BaseModel):
         if verbose:
             self.info()
             LOGGER.info("")
+
+        # after self.model is built
+        self.early_exit_enabled = True
+        self.exit_threshold = 0.70
+        self.exit_class_idx = 44   # COCO spoon
+        self.last_exit = "full"
+
+        self.aux_head = None
+        self.full_head = None
+
+        for m in self.model.modules():
+            if isinstance(m, AuxDetect):
+                self.aux_head = m
+            elif isinstance(m, Detect):
+                self.full_head = m
+
+        # temporary sync for aux head because Ultralytics only manages the last head automatically
+        if self.aux_head is not None and self.full_head is not None:
+            self.aux_head.inplace = self.full_head.inplace
+            if hasattr(self.full_head, "stride"):
+                self.aux_head.stride = self.full_head.stride[: self.aux_head.nl].clone()
+            if hasattr(self.full_head, "anchors") and hasattr(self.aux_head, "anchors"):
+                self.aux_head.anchors = self.full_head.anchors[: self.aux_head.nl].clone()
+            if hasattr(self.full_head, "strides") and hasattr(self.aux_head, "strides"):
+                self.aux_head.strides = self.full_head.strides[: self.aux_head.nl].clone()
 
     @property
     def end2end(self):
@@ -512,7 +552,32 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+    
+    def _max_aux_person_score(self, pred, class_idx=0):
+        meta = None
 
+        if isinstance(pred, (tuple, list)) and len(pred) > 1 and isinstance(pred[1], dict):
+            meta = pred[1]
+        elif isinstance(pred, dict):
+            meta = pred
+        else:
+            return 0.0
+
+        # Non-end2end Detect format: {"boxes": ..., "scores": ..., "feats": ...}
+        if "scores" in meta:
+            scores = meta["scores"].sigmoid()
+            return float(scores[:, class_idx, :].max().item())
+
+        # End2end Detect format: {"one2many": {...}, "one2one": {...}}
+        if "one2one" in meta and isinstance(meta["one2one"], dict) and "scores" in meta["one2one"]:
+            scores = meta["one2one"]["scores"].sigmoid()
+            return float(scores[:, class_idx, :].max().item())
+
+        if "one2many" in meta and isinstance(meta["one2many"], dict) and "scores" in meta["one2many"]:
+            scores = meta["one2many"]["scores"].sigmoid()
+            return float(scores[:, class_idx, :].max().item())
+
+        return 0.0
 
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
@@ -1681,6 +1746,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                AuxDetect,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,

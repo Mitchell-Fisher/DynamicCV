@@ -23,6 +23,7 @@ from .utils import bias_init_with_prob, linear_init
 __all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
 
+
 class Detect(nn.Module):
     """YOLO Detect head for object detection models.
 
@@ -250,6 +251,9 @@ class Detect(nn.Module):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
 
+class AuxDetect(Detect):
+    """Auxiliary detection head for early-exit experiments"""
+    pass
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
@@ -1776,3 +1780,8 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class AuxDetect(Detect):
+    """Auxiliary detection head for early-exit experiments."""
+    pass
