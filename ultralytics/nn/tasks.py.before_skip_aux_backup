@@ -187,17 +187,6 @@ class BaseModel(torch.nn.Module):
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
-
-            # Skip auxiliary detection head during inference when early exit is disabled.
-            # This avoids paying aux-head cost during full-path timing.
-            if (
-                not self.training
-                and not getattr(self, "early_exit_enabled", False)
-                and isinstance(m, (AuxDetect, SlimAuxDetect))
-            ):
-                y.append(None)
-                continue
-
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
@@ -362,12 +351,27 @@ class BaseModel(torch.nn.Module):
     def loss(self, batch, preds=None):
         """Compute loss.
 
-        Temporary experiment:
-        Force training forwards to width 0.75.
-        Do not run multi-width training here.
+        Slimmable-network support:
+        If self.slimmable_widths is set during training, run the same batch at
+        multiple widths and average the losses.
+
+        Example:
+            self.slimmable_widths = [1.0, 0.5]
         """
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
+
+        # The detection loss needs raw training-format head outputs.
+        # If validation passes decoded inference tensors, ignore them and recompute.
+        bad_preds = (
+            preds is None
+            or isinstance(preds, torch.Tensor)
+            or (
+                isinstance(preds, (tuple, list))
+                and len(preds) > 0
+                and isinstance(preds[0], torch.Tensor)
+            )
+        )
 
         old_training = self.training
         old_early_exit = getattr(self, "early_exit_enabled", None)
@@ -377,36 +381,48 @@ class BaseModel(torch.nn.Module):
             self.early_exit_enabled = False
 
         try:
-            # Force only training loss forwards to width 0.75.
-            if old_training and hasattr(self, "set_width"):
-                self.set_width(0.75)
+            widths = getattr(self, "slimmable_widths", None)
 
-                if not hasattr(self, "_debug_forced_loss_width_printed"):
-                    print("DEBUG BaseModel.loss forced width_mult:", getattr(self, "width_mult", None))
-                    self._debug_forced_loss_width_printed = True
+            # Multi-width training path.
+            # Only do this during actual training, not validation/eval.
+            if old_training and widths:
+                self.train()
 
-            bad_preds = (
-                preds is None
-                or isinstance(preds, torch.Tensor)
-                or (
-                    isinstance(preds, (tuple, list))
-                    and len(preds) > 0
-                    and isinstance(preds[0], torch.Tensor)
-                )
-            )
+                total_loss = None
+                total_items = None
 
+                for w in widths:
+                    self.set_width(w)
+
+                    # Forward with image tensor calls predict(), not loss(), so no recursion.
+                    preds_w = self.forward(batch["img"])
+                    loss_w, items_w = self.criterion(preds_w, batch)
+
+                    total_loss = loss_w if total_loss is None else total_loss + loss_w
+                    total_items = (
+                        items_w.detach()
+                        if total_items is None
+                        else total_items + items_w.detach()
+                    )
+
+                total_loss = total_loss / len(widths)
+                total_items = total_items / len(widths)
+
+                return total_loss, total_items
+
+            # Original single-width behavior.
             if bad_preds:
+                # Force raw Detect/AuxDetect dictionaries from the heads.
                 self.train()
                 preds = self.forward(batch["img"])
 
+                # Restore eval mode if validation called us while eval() was active.
                 if not old_training:
                     self.eval()
 
             return self.criterion(preds, batch)
 
         finally:
-            # Restore width after validation/eval calls.
-            # During training this matters less, because the next loss call forces 0.75 again.
             self.set_width(old_width)
 
             if old_training:
@@ -422,28 +438,10 @@ class BaseModel(torch.nn.Module):
         raise NotImplementedError("compute_loss() needs to be implemented by task heads")
 
     def set_width(self, width_mult: float):
-        """Set slimmable width for backbone/neck, but keep Detect heads fixed.
-
-        The model uses SlimToFixed layers before Detect/AuxDetect, so the Detect
-        heads should receive fixed-width features and should not be slimmed again.
-        """
         self.width_mult = float(width_mult)
-
-        head_types = (Detect, AuxDetect, SlimDetect, SlimAuxDetect)
-
-        for layer in self.model:
-            # Keep Detect/AuxDetect heads at full width.
-            if isinstance(layer, head_types):
-                for mm in layer.modules():
-                    if mm is not layer and hasattr(mm, "set_width"):
-                        mm.set_width(1.0)
-                continue
-
-            # Slim all non-head layers normally.
-            for mm in layer.modules():
-                if mm is not self and hasattr(mm, "set_width"):
-                    mm.set_width(width_mult)
-
+        for m in self.modules():
+            if m is not self and hasattr(m, "set_width"):
+                m.set_width(width_mult)
         return self
 
 class DetectionModel(BaseModel):

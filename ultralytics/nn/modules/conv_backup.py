@@ -8,7 +8,6 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 __all__ = (
     "CBAM",
@@ -40,23 +39,11 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 class Conv(nn.Module):
     """Standard convolution module with batch normalization and activation.
 
-    This version is backward-compatible with the normal Ultralytics Conv at
-    width=1.0, but it can also run a slimmer channel width by slicing the
-    stored full-width weights at inference/training time.
-
-    To use the slimmable path, call ``set_width(width_mult)`` on each Conv
-    module, for example with:
-
-        for m in model.model.modules():
-            if hasattr(m, "set_width"):
-                m.set_width(0.5)
-
     Attributes:
         conv (nn.Conv2d): Convolutional layer.
         bn (nn.BatchNorm2d): Batch normalization layer.
         act (nn.Module): Activation function layer.
         default_act (nn.Module): Default activation function (SiLU).
-        width_mult (float): Active width multiplier. 1.0 keeps stock behavior.
     """
 
     default_act = nn.SiLU()  # default activation
@@ -79,136 +66,28 @@ class Conv(nn.Module):
         self.bn = nn.BatchNorm2d(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
-        # Slimmable-network bookkeeping. These defaults preserve normal YOLO behavior.
-        self.base_c1 = c1
-        self.base_c2 = c2
-        self.base_groups = g
-        self.width_mult = 1.0
-
-    def set_width(self, width_mult: float = 1.0):
-        """Set active width multiplier for slimmable inference/training."""
-        width_mult = float(width_mult)
-        if width_mult <= 0:
-            raise ValueError(f"width_mult must be > 0, got {width_mult}")
-        self.width_mult = min(width_mult, 1.0)
-        return self
-
-    def _active_out_channels(self, x: torch.Tensor | None = None) -> int:
-        """Return active output channels for the current width.
-
-        If width_mult is still 1.0 but the input has already been slimmed by a
-        previous layer, infer the ratio from the input channel count. This makes
-        the layer more robust when only some modules receive set_width().
-        """
-        width = getattr(self, "width_mult", 1.0)
-
-        if x is not None and x.shape[1] < self.conv.in_channels:
-            inferred_width = x.shape[1] / float(self.conv.in_channels)
-            width = min(width, inferred_width)
-
-        out_ch = int(round(self.conv.out_channels * width))
-        out_ch = max(1, min(out_ch, self.conv.out_channels))
-
-        # For depthwise convolutions, active input and output channels must match.
-        if x is not None and self._is_depthwise():
-            out_ch = min(out_ch, x.shape[1])
-
-        return out_ch
-
-    def _is_depthwise(self) -> bool:
-        """Return True for depthwise convs where groups == in_ch == out_ch."""
-        return self.conv.groups == self.conv.in_channels == self.conv.out_channels
-
-    def _conv_forward_active(self, x: torch.Tensor, conv: nn.Conv2d, out_ch: int | None = None) -> tuple[torch.Tensor, int]:
-        """Run conv with channel slicing when the active width is below 1.0.
-
-        This is the important fix for width 0.5: slice both the output-channel
-        dimension and the input-channel dimension of the weight tensor.
-        """
-        in_ch = x.shape[1]
-        out_ch = self._active_out_channels(x) if out_ch is None else out_ch
-
-        # Fast path: stock Ultralytics behavior at full width.
-        base_groups = getattr(self, "base_groups", conv.groups)
-
-        if out_ch == conv.out_channels and in_ch == conv.in_channels and conv.groups == base_groups:
-            return conv(x), out_ch
-
-        if in_ch > conv.in_channels:
-            raise RuntimeError(
-                f"Slimmable Conv received {in_ch} input channels, but the stored conv only has "
-                f"{conv.in_channels}. This usually means an upstream concat/block is producing "
-                "more channels than this layer was built for."
-            )
-
-        # groups=1 is the common YOLO Conv case. This fixes errors like:
-        # weight [256, 256, 1, 1] receiving input with 128 channels.
-        if conv.groups == 1:
-            weight = conv.weight[:out_ch, :in_ch, :, :]
-            bias = conv.bias[:out_ch] if conv.bias is not None else None
-            groups = 1
-
-        # Depthwise case used by DWConv. The weight shape is [C, 1, k, k].
-        elif conv.groups == conv.in_channels == conv.out_channels:
-            out_ch = min(out_ch, in_ch)
-            weight = conv.weight[:out_ch, :, :, :]
-            bias = conv.bias[:out_ch] if conv.bias is not None else None
-            groups = out_ch
-            if x.shape[1] != out_ch:
-                x = x[:, :out_ch, :, :]
-
-        else:
-            # Generic grouped convolutions are uncommon in the YOLO paths used here.
-            # Keep them conservative instead of silently producing a wrong grouping.
-            if in_ch != conv.in_channels or out_ch != conv.out_channels:
-                raise RuntimeError(
-                    "Slimmable grouped Conv currently supports groups=1 and depthwise groups only. "
-                    f"Got groups={conv.groups}, input={in_ch}/{conv.in_channels}, "
-                    f"output={out_ch}/{conv.out_channels}."
-                )
-            return conv(x), out_ch
-
-        y = F.conv2d(
-            x,
-            weight,
-            bias,
-            stride=conv.stride,
-            padding=conv.padding,
-            dilation=conv.dilation,
-            groups=groups,
-        )
-        return y, out_ch
-
-    def _bn_forward_active(self, x: torch.Tensor, out_ch: int) -> torch.Tensor:
-        """Apply BatchNorm with sliced statistics/parameters for slim widths."""
-        if out_ch == self.bn.num_features:
-            return self.bn(x)
-
-        return F.batch_norm(
-            x,
-            self.bn.running_mean[:out_ch],
-            self.bn.running_var[:out_ch],
-            self.bn.weight[:out_ch] if self.bn.affine else None,
-            self.bn.bias[:out_ch] if self.bn.affine else None,
-            self.bn.training or not self.bn.track_running_stats,
-            self.bn.momentum,
-            self.bn.eps,
-        )
-
     def forward(self, x):
-        """Apply convolution, batch normalization and activation to input tensor."""
-        y, out_ch = self._conv_forward_active(x, self.conv)
-        return self.act(self._bn_forward_active(y, out_ch))
+        """Apply convolution, batch normalization and activation to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
-        """Apply fused convolution and activation without batch normalization.
+        """Apply convolution and activation without batch normalization.
 
-        Ultralytics prediction can replace ``forward`` with ``forward_fuse``.
-        This method must also slice channels, otherwise width 0.5 can crash
-        after fusion with a 256-channel conv receiving a 128-channel tensor.
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
         """
-        y, _ = self._conv_forward_active(x, self.conv)
-        return self.act(y)
+        return self.act(self.conv(x))
+
 
 class Conv2(Conv):
     """Simplified RepConv module with Conv fusing.
@@ -237,17 +116,26 @@ class Conv2(Conv):
         self.cv2 = nn.Conv2d(c1, c2, 1, s, autopad(1, p, d), groups=g, dilation=d, bias=False)  # add 1x1 conv
 
     def forward(self, x):
-        """Apply convolution, batch normalization and activation to input tensor."""
-        out_ch = self._active_out_channels(x)
-        y1, _ = self._conv_forward_active(x, self.conv, out_ch)
-        y2, _ = self._conv_forward_active(x, self.cv2, out_ch)
-        return self.act(self._bn_forward_active(y1 + y2, out_ch))
+        """Apply convolution, batch normalization and activation to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return self.act(self.bn(self.conv(x) + self.cv2(x)))
 
     def forward_fuse(self, x):
-        """Apply fused convolution, batch normalization and activation to input tensor."""
-        out_ch = self._active_out_channels(x)
-        y, _ = self._conv_forward_active(x, self.conv, out_ch)
-        return self.act(self._bn_forward_active(y, out_ch))
+        """Apply fused convolution, batch normalization and activation to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return self.act(self.bn(self.conv(x)))
 
     def fuse_convs(self):
         """Fuse parallel convolutions."""

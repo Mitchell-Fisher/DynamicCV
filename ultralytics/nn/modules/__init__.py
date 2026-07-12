@@ -107,6 +107,8 @@ from .transformer import (
     TransformerLayer,
 )
 
+from .slim import SlimAuxDetect, SlimC2PSA, SlimC3k2, SlimConv, SlimDetect, SlimSPPF, SlimToFixed
+
 __all__ = (
     "AIFI",
     "C1",
@@ -178,6 +180,7 @@ __all__ = (
     "SCDown",
     "Segment",
     "Segment26",
+    "SlimToFixed",
     "SpatialAttention",
     "TorchVision",
     "TransformerBlock",
