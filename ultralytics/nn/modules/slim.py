@@ -342,7 +342,13 @@ class SlimToFixed(nn.Module):
         width 1.0  -> use self.weight
         width 0.75 -> use self.weight_w0_75
 
-    Backward-compatible with old checkpoints that only contain self.weight.
+    Also owns a tiny width-0.75 class-logit calibrator:
+        class_scale_w0_75: [1, 80, 1]
+        class_bias_w0_75:  [1, 80, 1]
+
+    In this experiment only model.25's class calibration params are trained and
+    used by the inference patch. The params live inside SlimToFixed so they are
+    part of normal state_dict/checkpoint serialization.
     """
 
     def __init__(self, c1, c2, k=1, s=1, p=None, bias=False):
@@ -359,74 +365,75 @@ class SlimToFixed(nn.Module):
             self.p = p if isinstance(p, tuple) else (p, p)
 
         self.width_mult = 1.0
+        self.class_calib_nc = 80
 
-        # Original/full-width bridge. Keep this name so old checkpoints still load:
-        # model.23.weight, model.24.weight, model.25.weight
-        self.weight = nn.Parameter(torch.empty(c2, c1, self.k[0], self.k[1]))
+        # Original/full-width bridge. Keep the name "weight" so old checkpoints
+        # still load model.23.weight, model.24.weight, model.25.weight.
+        self.weight = nn.Parameter(torch.empty(self.c2, self.c1, self.k[0], self.k[1]))
 
-        # Width-specific 0.75 bridge.
-        self.weight_w0_75 = nn.Parameter(torch.empty(c2, c1, self.k[0], self.k[1]))
+        # Width-specific bridge for 0.75.
+        self.weight_w0_75 = nn.Parameter(torch.empty(self.c2, self.c1, self.k[0], self.k[1]))
 
         if bias:
-            self.bias = nn.Parameter(torch.zeros(c2))
-            self.bias_w0_75 = nn.Parameter(torch.zeros(c2))
+            self.bias = nn.Parameter(torch.zeros(self.c2))
+            self.bias_w0_75 = nn.Parameter(torch.zeros(self.c2))
         else:
             self.register_parameter("bias", None)
             self.register_parameter("bias_w0_75", None)
 
+        # Width-specific class-logit calibration params. Identity initialized.
+        self.class_scale_w0_75 = nn.Parameter(torch.ones(1, self.class_calib_nc, 1))
+        self.class_bias_w0_75 = nn.Parameter(torch.zeros(1, self.class_calib_nc, 1))
+
         self.reset_parameters()
 
     def __setstate__(self, state):
-        """
-        Called when loading pickled checkpoints.
-
-        Old checkpoints may not contain:
-            bias
-            bias_w0_75
-            weight_w0_75
-            width_mult
-            k/s/p/c1/c2
-
-        This backfills them immediately after unpickling, before optimizer setup.
-        """
+        """Backfill attributes/parameters when loading old pickled checkpoints."""
         super().__setstate__(state)
         self._ensure_compat_attrs()
 
     def _ensure_compat_attrs(self):
         """Backfill attributes missing from older checkpoints."""
-
         if not hasattr(self, "width_mult"):
             self.width_mult = 1.0
 
-        # Infer missing shape metadata from self.weight.
+        if not hasattr(self, "weight"):
+            raise RuntimeError("SlimToFixed checkpoint is missing required parameter 'weight'.")
+
         if not hasattr(self, "c2"):
             self.c2 = int(self.weight.shape[0])
-
         if not hasattr(self, "c1"):
             self.c1 = int(self.weight.shape[1])
-
         if not hasattr(self, "k"):
             self.k = (int(self.weight.shape[2]), int(self.weight.shape[3]))
-
         if not hasattr(self, "s"):
             self.s = (1, 1)
-
         if not hasattr(self, "p"):
             self.p = (self.k[0] // 2, self.k[1] // 2)
+        if not hasattr(self, "class_calib_nc"):
+            self.class_calib_nc = 80
 
-        # Older checkpoints may not have bias registered at all.
         if "bias" not in self._parameters:
             self.register_parameter("bias", None)
-
         if "bias_w0_75" not in self._parameters:
             self.register_parameter("bias_w0_75", None)
 
-        # Older checkpoints do not have weight_w0_75.
-        # Initialize it from the original/full-width bridge.
         if "weight_w0_75" not in self._parameters or self._parameters["weight_w0_75"] is None:
+            self.register_parameter("weight_w0_75", nn.Parameter(self.weight.detach().clone()))
+
+        ref = self.weight
+        device = ref.device
+        dtype = ref.dtype if ref.is_floating_point() else torch.float32
+
+        if "class_scale_w0_75" not in self._parameters or self._parameters["class_scale_w0_75"] is None:
             self.register_parameter(
-                "weight_w0_75",
-                nn.Parameter(self.weight.detach().clone()),
+                "class_scale_w0_75",
+                nn.Parameter(torch.ones(1, int(self.class_calib_nc), 1, device=device, dtype=dtype)),
+            )
+        if "class_bias_w0_75" not in self._parameters or self._parameters["class_bias_w0_75"] is None:
+            self.register_parameter(
+                "class_bias_w0_75",
+                nn.Parameter(torch.zeros(1, int(self.class_calib_nc), 1, device=device, dtype=dtype)),
             )
 
     def reset_parameters(self):
@@ -434,12 +441,13 @@ class SlimToFixed(nn.Module):
 
         with torch.no_grad():
             self.weight_w0_75.copy_(self.weight)
+            self.class_scale_w0_75.fill_(1.0)
+            self.class_bias_w0_75.zero_()
 
         if self.bias is not None:
             fan_in = self.weight.shape[1] * self.weight.shape[2] * self.weight.shape[3]
             bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.bias, -bound, bound)
-
             with torch.no_grad():
                 self.bias_w0_75.copy_(self.bias)
 
@@ -449,30 +457,16 @@ class SlimToFixed(nn.Module):
 
     def _active_weight_and_bias(self):
         self._ensure_compat_attrs()
-
-        # Use separate learned bridge only for width 0.75.
         if abs(float(getattr(self, "width_mult", 1.0)) - 0.75) < 1e-6:
             return self.weight_w0_75, self.bias_w0_75
-
-        # Full width and all unsupported widths use the original bridge.
         return self.weight, self.bias
 
     def forward(self, x):
         self._ensure_compat_attrs()
-
         weight, bias = self._active_weight_and_bias()
-
-        # Previous slimmable layers may output fewer input channels.
         in_ch = x.shape[1]
         weight = weight[:, :in_ch, :, :]
-
-        return F.conv2d(
-            x,
-            weight,
-            bias,
-            stride=self.s,
-            padding=self.p,
-        )
+        return F.conv2d(x, weight, bias, stride=self.s, padding=self.p)
 
 class SlimAuxDetect(SlimDetect):
     """Auxiliary slimmable detection head for early exit."""

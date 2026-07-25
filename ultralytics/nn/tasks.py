@@ -377,9 +377,14 @@ class BaseModel(torch.nn.Module):
             self.early_exit_enabled = False
 
         try:
-            # Force only training loss forwards to width 0.75.
-            if old_training and hasattr(self, "set_width"):
-                self.set_width(0.75)
+            # Force only training loss forwards to a requested width.
+            # Training scripts can set:
+            #   model.force_train_width = 0.75
+            #   model.force_train_width = 1.0
+            force_train_width = getattr(self, "force_train_width", None)
+
+            if old_training and force_train_width is not None and hasattr(self, "set_width"):
+                self.set_width(float(force_train_width))
 
                 if not hasattr(self, "_debug_forced_loss_width_printed"):
                     print("DEBUG BaseModel.loss forced width_mult:", getattr(self, "width_mult", None))
