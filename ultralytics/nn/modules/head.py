@@ -23,38 +23,6 @@ from .utils import bias_init_with_prob, linear_init
 __all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
 
-class SlimOutputConv2d(nn.Conv2d):
-    """Final prediction Conv2d that keeps fixed output channels but accepts slimmed input channels."""
-
-    def forward(self, x):
-        # Normal full-width case
-        if x.shape[1] == self.in_channels:
-            return super().forward(x)
-
-        # Only support groups=1 here because Detect output convs are regular 1x1 convs.
-        if self.groups != 1:
-            raise RuntimeError(
-                f"SlimOutputConv2d only supports groups=1, but got groups={self.groups}"
-            )
-
-        in_ch = x.shape[1]
-
-        if in_ch > self.in_channels:
-            raise RuntimeError(
-                f"Input has {in_ch} channels, but this conv was built for {self.in_channels}"
-            )
-
-        weight = self.weight[:, :in_ch, :, :]
-
-        return F.conv2d(
-            x,
-            weight,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
 
 class Detect(nn.Module):
     """YOLO Detect head for object detection models.
@@ -125,16 +93,16 @@ class Detect(nn.Module):
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         self.cv2 = nn.ModuleList(
-            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), SlimOutputConv2d(c2, 4 * self.reg_max, 1)) for x in ch
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
         self.cv3 = (
-            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), SlimOutputConv2d(c3, self.nc, 1)) for x in ch)
+            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
             if self.legacy
             else nn.ModuleList(
                 nn.Sequential(
                     nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
                     nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                    SlimOutputConv2d(c3, self.nc, 1),
+                    nn.Conv2d(c3, self.nc, 1),
                 )
                 for x in ch
             )
@@ -325,7 +293,7 @@ class Segment(Detect):
         self.proto = Proto(ch[0], self.npr, self.nm)  # protos
 
         c4 = max(ch[0] // 4, self.nm)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), SlimOutputConv2d(c4, self.nm, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
         if end2end:
             self.one2one_cv4 = copy.deepcopy(self.cv4)
 
@@ -485,7 +453,7 @@ class OBB(Detect):
         self.ne = ne  # number of extra parameters
 
         c4 = max(ch[0] // 4, self.ne)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), SlimOutputConv2d(c4, self.ne, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
         if end2end:
             self.one2one_cv4 = copy.deepcopy(self.cv4)
 
@@ -616,7 +584,7 @@ class Pose(Detect):
         self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
 
         c4 = max(ch[0] // 4, self.nk)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), SlimOutputConv2d(c4, self.nk, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
         if end2end:
             self.one2one_cv4 = copy.deepcopy(self.cv4)
 
@@ -725,9 +693,9 @@ class Pose26(Pose):
         c4 = max(ch[0] // 4, kpt_shape[0] * (kpt_shape[1] + 2))
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3)) for x in ch)
 
-        self.cv4_kpts = nn.ModuleList(SlimOutputConv2d(c4, self.nk, 1) for _ in ch)
+        self.cv4_kpts = nn.ModuleList(nn.Conv2d(c4, self.nk, 1) for _ in ch)
         self.nk_sigma = kpt_shape[0] * 2  # sigma_x, sigma_y for each keypoint
-        self.cv4_sigma = nn.ModuleList(SlimOutputConv2d(c4, self.nk_sigma, 1) for _ in ch)
+        self.cv4_sigma = nn.ModuleList(nn.Conv2d(c4, self.nk_sigma, 1) for _ in ch)
 
         if end2end:
             self.one2one_cv4 = copy.deepcopy(self.cv4)
@@ -901,7 +869,7 @@ class WorldDetect(Detect):
         """
         super().__init__(nc, reg_max=reg_max, end2end=end2end, ch=ch)
         c3 = max(ch[0], min(self.nc, 100))
-        self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), SlimOutputConv2d(c3, embed, 1)) for x in ch)
+        self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch)
         self.cv4 = nn.ModuleList(BNContrastiveHead(embed) if with_bn else ContrastiveHead() for _ in ch)
 
     def forward(self, x: list[torch.Tensor], text: torch.Tensor) -> dict[str, torch.Tensor] | tuple:
@@ -1045,13 +1013,13 @@ class YOLOEDetect(Detect):
         assert c3 <= embed
         assert with_bn
         self.cv3 = (
-            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), SlimOutputConv2d(c3, embed, 1)) for x in ch)
+            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch)
             if self.legacy
             else nn.ModuleList(
                 nn.Sequential(
                     nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
                     nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                    SlimOutputConv2d(c3, embed, 1),
+                    nn.Conv2d(c3, embed, 1),
                 )
                 for x in ch
             )
@@ -1263,7 +1231,7 @@ class YOLOESegment(YOLOEDetect):
         self.proto = Proto(ch[0], self.npr, self.nm)
 
         c5 = max(ch[0] // 4, self.nm)
-        self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), SlimOutputConv2d(c5, self.nm, 1)) for x in ch)
+        self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.nm, 1)) for x in ch)
         if end2end:
             self.one2one_cv5 = copy.deepcopy(self.cv5)
 
@@ -1419,7 +1387,7 @@ class YOLOESegment26(YOLOESegment):
         self.proto = Proto26(ch, self.npr, self.nm, nc)  # protos
 
         c5 = max(ch[0] // 4, self.nm)
-        self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), SlimOutputConv2d(c5, self.nm, 1)) for x in ch)
+        self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.nm, 1)) for x in ch)
         if end2end:
             self.one2one_cv5 = copy.deepcopy(self.cv5)
 
@@ -1803,7 +1771,7 @@ class v10Detect(Detect):
             nn.Sequential(
                 nn.Sequential(Conv(x, x, 3, g=x), Conv(x, c3, 1)),
                 nn.Sequential(Conv(c3, c3, 3, g=c3), Conv(c3, c3, 1)),
-                SlimOutputConv2d(c3, self.nc, 1),
+                nn.Conv2d(c3, self.nc, 1),
             )
             for x in ch
         )

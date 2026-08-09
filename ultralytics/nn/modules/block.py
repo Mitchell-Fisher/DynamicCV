@@ -313,7 +313,7 @@ class C2f(nn.Module):
 
     def forward_split(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using split() instead of chunk()."""
-        y = self.cv1(x).chunk(2, dim=1)
+        y = self.cv1(x).split((self.c, self.c), 1)
         y = [y[0], y[1]]
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
@@ -679,7 +679,7 @@ class C2fAttn(nn.Module):
         Returns:
             (torch.Tensor): Output tensor after processing.
         """
-        y = list(self.cv1(x).chunk(2, 1))
+        y = list(self.cv1(x).split((self.c, self.c), 1))
         y.extend(m(y[-1]) for m in self.m)
         y.append(self.attn(y[-1], guide))
         return self.cv2(torch.cat(y, 1))
@@ -893,7 +893,7 @@ class RepNCSPELAN4(nn.Module):
 
     def forward_split(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using split() instead of chunk()."""
-        y = list(self.cv1(x).chunk(2, 1))
+        y = list(self.cv1(x).split((self.c, self.c), 1))
         y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
         return self.cv4(torch.cat(y, 1))
 
@@ -1305,50 +1305,26 @@ class Attention(nn.Module):
         self.proj = Conv(dim, dim, 1, act=False)
         self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the Attention module.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            (torch.Tensor): The output tensor after self-attention.
+        """
         B, C, H, W = x.shape
         N = H * W
-
         qkv = self.qkv(x)
-        qkv_c = qkv.shape[1]
-
-        # Full-width channels per attention head.
-        full_per_head = self.key_dim * 2 + self.head_dim
-
-        # At width=0.5, qkv_c is usually half, so reduce the number of heads.
-        # Example: full qkv_c=256 with 2 heads -> slim qkv_c=128 with 1 head.
-        if qkv_c % full_per_head == 0:
-            active_heads = max(1, qkv_c // full_per_head)
-            key_dim = self.key_dim
-            head_dim = self.head_dim
-            per_head = full_per_head
-        else:
-            # Fallback for widths that do not preserve whole full-size heads.
-            active_heads = min(self.num_heads, qkv_c)
-            while active_heads > 1 and qkv_c % active_heads != 0:
-                active_heads -= 1
-
-            per_head = qkv_c // active_heads
-
-            # Preserve approximately the original key/value ratio.
-            attn_ratio = self.key_dim / max(self.head_dim, 1)
-            head_dim = max(1, int(per_head / (1 + 2 * attn_ratio)))
-            key_dim = max(1, (per_head - head_dim) // 2)
-            head_dim = per_head - 2 * key_dim
-
-        q, k, v = qkv.view(B, active_heads, per_head, N).split(
-            [key_dim, key_dim, head_dim], dim=2
+        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2
         )
 
-        scale = key_dim**-0.5
-        attn = (q.transpose(-2, -1) @ k) * scale
+        attn = (q.transpose(-2, -1) @ k) * self.scale
         attn = attn.softmax(dim=-1)
-
-        out_c = active_heads * head_dim
-        x = (v @ attn.transpose(-2, -1)).view(B, out_c, H, W)
-        x = x + self.pe(v.reshape(B, out_c, H, W))
+        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
         x = self.proj(x)
-
         return x
 
 
@@ -1451,7 +1427,7 @@ class PSA(nn.Module):
         Returns:
             (torch.Tensor): Output tensor after attention and feed-forward processing.
         """
-        a, b = self.cv1(x).chunk(2, dim=1)
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = b + self.attn(b)
         b = b + self.ffn(b)
         return self.cv2(torch.cat((a, b), 1))
@@ -1507,7 +1483,7 @@ class C2PSA(nn.Module):
         Returns:
             (torch.Tensor): Output tensor after processing.
         """
-        a, b = self.cv1(x).chunk(2, dim=1)
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
 
