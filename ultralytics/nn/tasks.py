@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from ultralytics.nn.modules.slim import configure_slim_widths
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -45,7 +46,6 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
-    AuxDetect,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -67,13 +67,12 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
-    SlimAuxDetect,
+    SlimConcat,
     SlimC2PSA,
     SlimC3k2,
     SlimConv,
     SlimDetect,
     SlimSPPF,
-    SlimToFixed,
     TorchVision,
     WorldDetect,
     YOLOEDetect,
@@ -181,22 +180,12 @@ class BaseModel(torch.nn.Module):
         y, dt, embeddings = [], [], []  # outputs
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
-        self.last_exit = "full"
+        
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
-
-            # Skip auxiliary detection head during inference when early exit is disabled.
-            # This avoids paying aux-head cost during full-path timing.
-            if (
-                not self.training
-                and not getattr(self, "early_exit_enabled", False)
-                and isinstance(m, (AuxDetect, SlimAuxDetect))
-            ):
-                y.append(None)
-                continue
 
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
@@ -206,25 +195,6 @@ class BaseModel(torch.nn.Module):
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
-            if (
-                self.training
-                and getattr(self, "train_aux_only", False)
-                and isinstance(m, (AuxDetect, SlimAuxDetect))
-            ):
-                return x
-
-            if (
-                not self.training
-                and getattr(self, "early_exit_enabled", False)
-                and isinstance(m, (AuxDetect, SlimAuxDetect))
-            ):
-                person_conf = self._max_aux_person_score(x, self.exit_class_idx)
-                # print("AUX raw object score =", person_conf)
-                if person_conf >= self.exit_threshold:
-                    self.last_exit = "aux"
-                    return x[0] if isinstance(x, (tuple, list)) else x
-                # if isinstance(x, (tuple, list)) and len(x) > 1 and isinstance(x[1], dict):
-                    # print("AUX meta keys:", x[1].keys())
         return x
 
     def _predict_augment(self, x):
@@ -335,119 +305,156 @@ class BaseModel(torch.nn.Module):
         return self
 
     def load(self, weights, verbose=True):
-        """Load weights into the model.
+        """Load pretrained weights and report slimmable-model compatibility."""
 
-        Args:
-            weights (dict | torch.nn.Module): The pre-trained weights to be loaded.
-            verbose (bool, optional): Whether to log the transfer progress.
-        """
-        model = weights["model"] if isinstance(weights, dict) else weights  # torchvision models are not dicts
-        csd = model.float().state_dict()  # checkpoint state_dict as FP32
-        updated_csd = intersect_dicts(csd, self.state_dict())  # intersect
-        self.load_state_dict(updated_csd, strict=False)  # load
-        len_updated_csd = len(updated_csd)
-        first_conv = "model.0.conv.weight"  # hard-coded to yolo models for now
-        # mostly used to boost multi-channel training
-        state_dict = self.state_dict()
-        if first_conv not in updated_csd and first_conv in state_dict:
-            c1, c2, h, w = state_dict[first_conv].shape
-            cc1, cc2, ch, cw = csd[first_conv].shape
-            if ch == h and cw == w:
-                c1, c2 = min(c1, cc1), min(c2, cc2)
-                state_dict[first_conv][:c1, :c2] = csd[first_conv][:c1, :c2]
-                len_updated_csd += 1
+        model = (
+            weights["model"]
+            if isinstance(weights, dict)
+            else weights
+        )
+
+        source = model.float().state_dict()
+        target = self.state_dict()
+
+        transferred = intersect_dicts(
+            source,
+            target,
+        )
+
+        self.load_state_dict(
+            transferred,
+            strict=False,
+        )
+
+        # Width-specific BN parameters do not exist in
+        # the normal pretrained checkpoint.
+        full_width_keys = [
+            k
+            for k in target
+            if ".width_bns." not in k
+        ]
+
+        transferred_full = [
+            k
+            for k in transferred
+            if ".width_bns." not in k
+        ]
+
+        missing_structural = [
+            k
+            for k in full_width_keys
+            if k not in transferred
+        ]
+
         if verbose:
-            LOGGER.info(f"Transferred {len_updated_csd}/{len(self.model.state_dict())} items from pretrained weights")
+            LOGGER.info(
+                f"Transferred "
+                f"{len(transferred_full)}/"
+                f"{len(full_width_keys)} "
+                f"full-width-compatible items "
+                f"from pretrained weights"
+            )
+
+            width_bn_count = sum(
+                ".width_bns." in k
+                for k in target
+            )
+
+            LOGGER.info(
+                f"{width_bn_count} width-specific BN "
+                f"items are newly initialized"
+            )
+
+            if missing_structural:
+                LOGGER.warning(
+                    f"{len(missing_structural)} "
+                    f"non-width-BN items did not transfer."
+                )
+
+                for k in missing_structural[:20]:
+                    LOGGER.warning(
+                        f"  missing: {k}"
+                    )
 
     def loss(self, batch, preds=None):
-        """Compute loss.
+        """Compute loss, optionally at a forced slimmable width."""
 
-        Temporary experiment:
-        Force training forwards to width 0.75.
-        Do not run multi-width training here.
-        """
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
 
-        old_training = self.training
-        old_early_exit = getattr(self, "early_exit_enabled", None)
-        old_width = getattr(self, "width_mult", 1.0)
-
-        if old_early_exit is not None:
-            self.early_exit_enabled = False
+        old_width = getattr(
+            self,
+            "width_mult",
+            1.0,
+        )
 
         try:
-            # Force only training loss forwards to a requested width.
-            # Training scripts can set:
-            #   model.force_train_width = 0.75
-            #   model.force_train_width = 1.0
-            force_train_width = getattr(self, "force_train_width", None)
-
-            if old_training and force_train_width is not None and hasattr(self, "set_width"):
-                self.set_width(float(force_train_width))
-
-                if not hasattr(self, "_debug_forced_loss_width_printed"):
-                    print("DEBUG BaseModel.loss forced width_mult:", getattr(self, "width_mult", None))
-                    self._debug_forced_loss_width_printed = True
-
-            bad_preds = (
-                preds is None
-                or isinstance(preds, torch.Tensor)
-                or (
-                    isinstance(preds, (tuple, list))
-                    and len(preds) > 0
-                    and isinstance(preds[0], torch.Tensor)
-                )
+            force_train_width = getattr(
+                self,
+                "force_train_width",
+                None,
             )
 
-            if bad_preds:
-                self.train()
-                preds = self.forward(batch["img"])
+            if (
+                self.training
+                and force_train_width is not None
+            ):
+                self.set_width(
+                    float(force_train_width)
+                )
 
-                if not old_training:
-                    self.eval()
+            if preds is None:
+                preds = self.predict(
+                    batch["img"]
+                )
 
-            return self.criterion(preds, batch)
+            return self.criterion(
+                preds,
+                batch,
+            )
 
         finally:
-            # Restore width after validation/eval calls.
-            # During training this matters less, because the next loss call forces 0.75 again.
             self.set_width(old_width)
-
-            if old_training:
-                self.train()
-            else:
-                self.eval()
-
-            if old_early_exit is not None:
-                self.early_exit_enabled = old_early_exit
 
     def init_criterion(self):
         """Initialize the loss criterion for the BaseModel."""
         raise NotImplementedError("compute_loss() needs to be implemented by task heads")
 
     def set_width(self, width_mult: float):
-        """Set slimmable width for backbone/neck, but keep Detect heads fixed.
+        """Set the active runtime width of the slimmable model."""
 
-        The model uses SlimToFixed layers before Detect/AuxDetect, so the Detect
-        heads should receive fixed-width features and should not be slimmed again.
-        """
-        self.width_mult = float(width_mult)
+        width_mult = float(width_mult)
 
-        head_types = (Detect, AuxDetect, SlimDetect, SlimAuxDetect)
+        allowed = getattr(
+            self,
+            "slim_widths",
+            None,
+        )
+
+        if allowed is not None and not any(
+            abs(width_mult - w) < 1e-6
+            for w in allowed
+        ):
+            raise ValueError(
+                f"Unsupported width {width_mult}. "
+                f"Available widths: {allowed}"
+            )
+
+        def apply_width(module):
+            # If this module knows how to propagate width internally,
+            # let it do so and stop descending here.
+            if hasattr(module, "set_width"):
+                module.set_width(width_mult)
+                return
+
+            # Otherwise search its children.
+            for child in module.children():
+                apply_width(child)
 
         for layer in self.model:
-            # Keep Detect/AuxDetect heads at full width.
-            if isinstance(layer, head_types):
-                for mm in layer.modules():
-                    if mm is not layer and hasattr(mm, "set_width"):
-                        mm.set_width(1.0)
-                continue
+            apply_width(layer)
 
-            # Slim all non-head layers normally.
-            for mm in layer.modules():
-                if mm is not self and hasattr(mm, "set_width"):
-                    mm.set_width(width_mult)
+        self.width_mult = width_mult
 
         return self
 
@@ -503,9 +510,33 @@ class DetectionModel(BaseModel):
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
-        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
-        self.inplace = self.yaml.get("inplace", True)
+        
+        self.slim_widths = configure_slim_widths(
+            self.yaml.get(
+                "slim_widths",
+                [1.0],
+            )
+        )
+
+        self.model, self.save = parse_model(
+            deepcopy(self.yaml),
+            ch=ch,
+            verbose=verbose,
+        )
+
+        self.names = {
+            i: f"{i}"
+            for i in range(self.yaml["nc"])
+        }
+
+        self.inplace = self.yaml.get(
+            "inplace",
+            True,
+        )
+
+        # Start deterministically at full width.
+        self.width_mult = 1.0
+        self.set_width(1.0)
 
         # Build strides
         m = self.model[-1]  # Detect()
@@ -534,32 +565,6 @@ class DetectionModel(BaseModel):
         if verbose:
             self.info()
             LOGGER.info("")
-
-        # after self.model is built
-        self.train_aux_only = False
-        self.early_exit_enabled = True
-        self.exit_threshold = 0.70
-        self.exit_class_idx = 1   # COCO person (default)
-        self.last_exit = "full"
-
-        self.aux_head = None
-        self.full_head = None
-
-        for m in self.model.modules():
-            if isinstance(m, (AuxDetect, SlimAuxDetect)):
-                self.aux_head = m
-            elif isinstance(m, (Detect, SlimDetect)):
-                self.full_head = m
-
-        # temporary sync for aux head because Ultralytics only manages the last head automatically
-        if self.aux_head is not None and self.full_head is not None:
-            self.aux_head.inplace = self.full_head.inplace
-            if hasattr(self.full_head, "stride"):
-                self.aux_head.stride = self.full_head.stride[: self.aux_head.nl].clone()
-            if hasattr(self.full_head, "anchors") and hasattr(self.aux_head, "anchors"):
-                self.aux_head.anchors = self.full_head.anchors[: self.aux_head.nl].clone()
-            if hasattr(self.full_head, "strides") and hasattr(self.aux_head, "strides"):
-                self.aux_head.strides = self.full_head.strides[: self.aux_head.nl].clone()
 
     @property
     def end2end(self):
@@ -651,33 +656,8 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
     
-    def _max_aux_person_score(self, pred, class_idx=0):
-        meta = None
-
-        if isinstance(pred, (tuple, list)) and len(pred) > 1 and isinstance(pred[1], dict):
-            meta = pred[1]
-        elif isinstance(pred, dict):
-            meta = pred
-        else:
-            return 0.0
-
-        # Non-end2end Detect format: {"boxes": ..., "scores": ..., "feats": ...}
-        if "scores" in meta:
-            scores = meta["scores"].sigmoid()
-            return float(scores[:, class_idx, :].max().item())
-
-        # End2end Detect format: {"one2many": {...}, "one2one": {...}}
-        if "one2one" in meta and isinstance(meta["one2one"], dict) and "scores" in meta["one2one"]:
-            scores = meta["one2one"]["scores"].sigmoid()
-            return float(scores[:, class_idx, :].max().item())
-
-        if "one2many" in meta and isinstance(meta["one2many"], dict) and "scores" in meta["one2many"]:
-            scores = meta["one2many"]["scores"].sigmoid()
-            return float(scores[:, class_idx, :].max().item())
-
-        return 0.0
-
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
 
@@ -1728,9 +1708,15 @@ def parse_model(d, ch, verbose=True):
         depth, width, max_channels = scales[scale]
 
     if act:
-        Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU()
+        default_act = eval(act)
+
+        Conv.default_act = default_act
+        SlimConv.default_act = default_act
+
         if verbose:
-            LOGGER.info(f"{colorstr('activation:')} {act}")  # print
+            LOGGER.info(
+                f"{colorstr('activation:')} {act}"
+            )
 
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
@@ -1774,7 +1760,6 @@ def parse_model(d, ch, verbose=True):
             SlimC3k2,
             SlimSPPF,
             SlimC2PSA,
-            SlimToFixed,
             C2fCIB,
             A2C2f,
         }
@@ -1827,11 +1812,11 @@ def parse_model(d, ch, verbose=True):
                 n = 1
             if m in {C3k2, SlimC3k2}:  # for YOLO26-style heads
                 legacy = False
-                if scale in "mlx":
+                if scale and scale in "mlx":
                     args[3] = True
             if m is A2C2f:
                 legacy = False
-                if scale in "lx":  # for L/X sizes
+                if scale and scale in "lx":  # for L/X sizes
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
@@ -1847,15 +1832,21 @@ def parse_model(d, ch, verbose=True):
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
-        elif m is Concat:
+        elif m in {Concat, SlimConcat}:
             c2 = sum(ch[x] for x in f)
+
+            if m is SlimConcat:
+                # YAML supplies dimension, e.g. [1].
+                # Append full-width channel counts for each source.
+                args = [
+                    *args,
+                    [ch[x] for x in f],
+                ]
         elif m in frozenset(
             {
                 Detect,
-                AuxDetect,
                 WorldDetect,
                 SlimDetect,
-                SlimAuxDetect,                
                 YOLOEDetect,
                 Segment,
                 Segment26,
@@ -1872,9 +1863,7 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {
                 Detect,
-                AuxDetect,
                 SlimDetect,
-                SlimAuxDetect,
                 YOLOEDetect,
                 Segment,
                 Segment26,
@@ -1937,7 +1926,14 @@ def yaml_model_load(path):
     unified_path = re.sub(r"(\d+)([nslmx])(.+)?$", r"\1\3", str(path))  # i.e. yolov8x.yaml -> yolov8.yaml
     yaml_file = check_yaml(unified_path, hard=False) or check_yaml(path)
     d = YAML.load(yaml_file)  # model dict
-    d["scale"] = guess_model_scale(path)
+    
+    guessed_scale = guess_model_scale(path)
+
+    if guessed_scale:
+        d["scale"] = guessed_scale
+    else:
+        d["scale"] = d.get("scale", "")
+
     d["yaml_file"] = str(path)
     return d
 

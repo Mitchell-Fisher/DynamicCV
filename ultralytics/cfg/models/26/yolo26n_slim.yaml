@@ -1,9 +1,15 @@
-# Ultralytics YOLO26 slim-backbone early-exit model
-# Option A: slimmable backbone/neck, fixed Detect/AuxDetect heads
+# Ultralytics YOLO26 Yu-style slim-backbone model
+# Shared convolution weights with width-specific BatchNorm statistics
 
 nc: 80
 end2end: True
 reg_max: 1
+
+# Base Ultralytics architecture scale.
+scale: n
+
+# Runtime slimmable widths.
+slim_widths: [1.0, 0.875, 0.75, 0.625, 0.5]
 
 scales:
   n: [0.50, 0.25, 1024]
@@ -23,30 +29,23 @@ backbone:
   - [-1, 1, SlimConv, [1024, 3, 2]] # 7-P5/32
   - [-1, 2, SlimC3k2, [1024, True]]
   - [-1, 1, SlimSPPF, [1024, 5, 3, True]] # 9
-  - [-1, 2, C2PSA, [1024]] # 10
+  - [-1, 2, SlimC2PSA, [1024]] # 10
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 6], 1, Concat, [1]]
+  - [[-1, 6], 1, SlimConcat, [1]]
   - [-1, 2, SlimC3k2, [512, True]] # 13
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 4], 1, Concat, [1]]
-  - [-1, 2, SlimC3k2, [256, True]] # 16 P3 slim
+  - [[-1, 4], 1, SlimConcat, [1]]
+  - [-1, 2, SlimC3k2, [256, True]] # 16-P3
 
   - [-1, 1, SlimConv, [256, 3, 2]]
-  - [[-1, 13], 1, Concat, [1]]
-  - [-1, 2, SlimC3k2, [512, True]] # 19 P4 slim
+  - [[-1, 13], 1, SlimConcat, [1]]
+  - [-1, 2, SlimC3k2, [512, True]] # 19-P4
 
   - [-1, 1, SlimConv, [512, 3, 2]]
-  - [[-1, 10], 1, Concat, [1]]
-  - [-1, 1, C3k2, [1024, True, 0.5, True]] # 22 P5 slim
+  - [[-1, 10], 1, SlimConcat, [1]]
+  - [-1, 1, SlimC3k2, [1024, True, 0.5, True]] # 22-P5
 
-  # Convert slim feature maps back to fixed-width channels for stock heads.
-  - [16, 1, SlimToFixed, [256, 1, 1]] # 23 P3 fixed
-  - [19, 1, SlimToFixed, [512, 1, 1]] # 24 P4 fixed
-  - [22, 1, SlimToFixed, [1024, 1, 1]] # 25 P5 fixed
-
-  # Keep original heads.
-  - [[23, 24], 1, AuxDetect, [nc]] # 26 aux head
-  - [[23, 24, 25], 1, Detect, [nc]] # 27 full head
+  - [[16, 19, 22], 1, SlimDetect, [nc]]
