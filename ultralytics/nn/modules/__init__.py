@@ -81,7 +81,6 @@ from .head import (
     OBB26,
     Classify,
     Detect,
-    AuxDetect,
     LRPCHead,
     Pose,
     Pose26,
@@ -107,7 +106,14 @@ from .transformer import (
     TransformerLayer,
 )
 
-from .slim import SlimAuxDetect, SlimC2PSA, SlimC3k2, SlimConv, SlimDetect, SlimSPPF, SlimToFixed
+from .slim import (
+    SlimConcat,
+    SlimC2PSA,
+    SlimC3k2,
+    SlimConv,
+    SlimDetect,
+    SlimSPPF,
+)
 
 __all__ = (
     "AIFI",
@@ -180,7 +186,12 @@ __all__ = (
     "SCDown",
     "Segment",
     "Segment26",
-    "SlimToFixed",
+    "SlimConcat",
+    "SlimC2PSA",
+    "SlimC3k2",
+    "SlimConv",
+    "SlimDetect",
+    "SlimSPPF",
     "SpatialAttention",
     "TorchVision",
     "TransformerBlock",
