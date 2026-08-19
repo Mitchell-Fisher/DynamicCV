@@ -138,7 +138,11 @@ def _group_prefix_indices(
 
 class SwitchableBN2d(nn.BatchNorm2d):
     def __init__(self, c_max, widths=None):
-        super().__init__(c_max)
+        super().__init__(
+            c_max,
+            eps=0.001,
+            momentum=0.03,
+        )
 
         self.c_max = c_max
         self.width_mult = 1.0
@@ -148,7 +152,9 @@ class SwitchableBN2d(nn.BatchNorm2d):
         )
         self.width_bns = nn.ModuleDict({
             _width_key(w, self.widths): nn.BatchNorm2d(
-                _active(c_max, w)
+                _active(c_max, w),
+                eps=0.001,
+                momentum=0.03,
             )
             for w in self.widths
             if abs(w - 1.0) > 1e-6
