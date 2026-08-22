@@ -81,7 +81,6 @@ from .head import (
     OBB26,
     Classify,
     Detect,
-    AuxDetect,
     LRPCHead,
     Pose,
     Pose26,
@@ -105,6 +104,15 @@ from .transformer import (
     TransformerBlock,
     TransformerEncoderLayer,
     TransformerLayer,
+)
+
+from .slim import (
+    SlimConcat,
+    SlimC2PSA,
+    SlimC3k2,
+    SlimConv,
+    SlimDetect,
+    SlimSPPF,
 )
 
 __all__ = (
@@ -178,6 +186,12 @@ __all__ = (
     "SCDown",
     "Segment",
     "Segment26",
+    "SlimConcat",
+    "SlimC2PSA",
+    "SlimC3k2",
+    "SlimConv",
+    "SlimDetect",
+    "SlimSPPF",
     "SpatialAttention",
     "TorchVision",
     "TransformerBlock",

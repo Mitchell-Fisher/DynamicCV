@@ -250,10 +250,7 @@ class Detect(nn.Module):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
-
-class AuxDetect(Detect):
-    """Auxiliary detection head for early-exit experiments"""
-    pass
+        
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
@@ -1780,8 +1777,3 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
-
-
-class AuxDetect(Detect):
-    """Auxiliary detection head for early-exit experiments."""
-    pass
