@@ -216,23 +216,143 @@ class SlimConv(nn.Module):
             else nn.Identity()
         )
 
+        self._use_cached_out_idx = True
+
+        self._build_out_idx_cache()
+
+    def _build_out_idx_cache(self):
+        """
+        Build prefix output-channel index tensors once for all
+        supported widths.
+
+        This also provides backward compatibility with checkpoints
+        created before these cached indices existed.
+        """
+
+        # If the cache already exists, do nothing.
+        if hasattr(self, "_out_idx_names"):
+            return
+
+        self._out_idx_names = {}
+
+        # Build the tensors on the same device as the convolution.
+        device = self.conv.weight.device
+
+        for width in self.bn.widths:
+            key = _width_key(width, self.bn.widths)
+            name = f"_cached_out_idx_{key}"
+
+            self.register_buffer(
+                name,
+                torch.arange(
+                    _active(self.c2_max, width),
+                    device=device,
+                    dtype=torch.long,
+                ),
+                persistent=False,
+            )
+
+            self._out_idx_names[key] = name
+
+        # Match the cache selection to whatever width the loaded
+        # module currently has.
+        key = _width_key(
+            self.width_mult,
+            self.bn.widths,
+        )
+
+        self._active_out_idx_name = self._out_idx_names[key]
+
     def set_width(self, width: float):
+        # ----------------------------------------------------------
+        # Important for old checkpoints:
+        #
+        # torch.load() restores the saved SlimConv object without
+        # rerunning this class's new __init__(). Therefore an older
+        # checkpoint will not yet contain _out_idx_names.
+        # ----------------------------------------------------------
+        if not hasattr(self, "_out_idx_names"):
+            self._build_out_idx_cache()
+
+        key = _width_key(
+            width,
+            self.bn.widths,
+        )
+
         self.bn.set_width(width)
         self.width_mult = float(width)
+
+        self._active_out_idx_name = self._out_idx_names[key]
+
         return self
 
     def active_out(self):
-        return _active(self.c2_max, self.width_mult)
+        return _active(
+            self.c2_max,
+            self.width_mult,
+        )
 
     def forward(self, x):
-        cout = self.active_out()
 
-        if self._is_depthwise():
-            cout = x.shape[1]
+        use_cache = getattr(
+            self,
+            "_use_cached_out_idx",
+            True,
+        )
 
-        out_idx = torch.arange(cout, device=x.device)
+        # ----------------------------------------------------------
+        # BASELINE MODE:
+        # Original implementation.
+        #
+        # Reconstruct the output prefix on every forward.
+        # ----------------------------------------------------------
+        if not use_cache:
+            cout = self.active_out()
 
-        return self.forward_indexed(x, out_idx)
+            if self._is_depthwise():
+                cout = x.shape[1]
+
+            out_idx = torch.arange(
+                cout,
+                device=x.device,
+                dtype=torch.long,
+            )
+
+            return self.forward_indexed(
+                x,
+                out_idx,
+            )
+
+        # ----------------------------------------------------------
+        # OPTIMIZED MODE:
+        # Reuse cached prefix indices.
+        # ----------------------------------------------------------
+
+        # Backward compatibility for old serialized checkpoints.
+        if not hasattr(self, "_out_idx_names"):
+            self._build_out_idx_cache()
+
+        out_idx = getattr(
+            self,
+            self._active_out_idx_name,
+        )
+
+        # Preserve old depthwise behavior if an unexpected
+        # channel count reaches the layer.
+        if (
+                self._is_depthwise()
+                and out_idx.numel() != x.shape[1]
+        ):
+            out_idx = torch.arange(
+                x.shape[1],
+                device=x.device,
+                dtype=torch.long,
+            )
+
+        return self.forward_indexed(
+            x,
+            out_idx,
+        )
     
     def _is_depthwise(self):
         return (
@@ -308,6 +428,19 @@ class SlimConv(nn.Module):
 
         return self.act(self.bn(y))
 
+    def set_cached_indices(self, enabled: bool):
+        """
+        Enable or disable cached output-prefix indices.
+
+        enabled=True:
+            Reuse precomputed prefix indices.
+
+        enabled=False:
+            Reproduce the original behavior by constructing
+            torch.arange() every forward.
+        """
+        self._use_cached_out_idx = bool(enabled)
+        return self
 
 class SlimPredConv(nn.Conv2d):
     def __init__(self, c1_max, c2):
