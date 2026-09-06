@@ -574,6 +574,64 @@ class SlimConv(nn.Module):
             self.bn(y)
         )
 
+    def forward_materialized_depthwise(
+            self,
+            x,
+            weight,
+    ):
+        """
+        Run a depthwise SlimConv using an already-materialized compact
+        kernel tensor.
+
+        Used by Optimization 2B-5A for SlimAttention positional
+        encoding.
+
+        The supplied weight must already contain one kernel for each
+        compact input channel, in exactly the same channel order as x.
+        """
+
+        if not self._is_depthwise():
+            raise RuntimeError(
+                "forward_materialized_depthwise() requires a "
+                "depthwise SlimConv."
+            )
+
+        expected = self.bn.active_features()
+
+        if weight.shape[0] != expected:
+            raise RuntimeError(
+                f"Materialized depthwise weight has "
+                f"{weight.shape[0]} output channels, "
+                f"but BN expects {expected}."
+            )
+
+        if weight.shape[0] != x.shape[1]:
+            raise RuntimeError(
+                f"Materialized depthwise weight has "
+                f"{weight.shape[0]} kernels, but input tensor "
+                f"has {x.shape[1]} channels."
+            )
+
+        if weight.shape[1] != 1:
+            raise RuntimeError(
+                "Materialized depthwise convolution weight must "
+                "have shape [C, 1, kH, kW]."
+            )
+
+        y = F.conv2d(
+            x,
+            weight,
+            bias=None,
+            stride=self.conv.stride,
+            padding=self.conv.padding,
+            dilation=self.conv.dilation,
+            groups=x.shape[1],
+        )
+
+        return self.act(
+            self.bn(y)
+        )
+
     def forward(self, x):
 
         # ==========================================================
@@ -1195,6 +1253,10 @@ class SlimAttention(nn.Module):
         self.widths = tuple(self.qkv.bn.widths)
         
         self.width_mult = 1.0
+        # Cache the complete narrow-width QKV, projection, and
+        # positional-encoding convolution weights.
+        self._use_compact_attention_weight_cache = True
+        self._compact_attention_weight_cache_meta = {}
 
 
     def set_width(self, width: float):
@@ -1301,12 +1363,13 @@ class SlimAttention(nn.Module):
             dtype=torch.long,
         )
 
-
     def forward(self, x):
         B, C, H, W = x.shape
         N = H * W
 
-        dim, head_dim, key_dim = self._active_dims()
+        dim, head_dim, key_dim = (
+            self._active_dims()
+        )
 
         if C != dim:
             raise RuntimeError(
@@ -1314,24 +1377,71 @@ class SlimAttention(nn.Module):
                 f"at width {self.width_mult}, but received {C}."
             )
 
-        # ---------------------------------------------------------
-        # 1. QKV
-        # ---------------------------------------------------------
+        # ==========================================================
+        # OPTIMIZATION 2B-5A
+        # ==========================================================
 
-        qkv_idx = self._qkv_indices(
-            head_dim,
-            key_dim,
-            x.device,
+        use_compact_cache = getattr(
+            self,
+            "_use_compact_attention_weight_cache",
+            True,
         )
 
-        qkv = self.qkv.forward_indexed(
-            x,
-            out_idx=qkv_idx,
+        use_materialized_weights = (
+                use_compact_cache
+                and not self.training
+                and abs(
+            self.width_mult - 1.0
+        ) >= 1e-6
         )
 
-        per_head = 2 * key_dim + head_dim
+        if use_materialized_weights:
 
-        expected_qkv = self.num_heads * per_head
+            (
+                qkv_weight,
+                pe_weight,
+                proj_weight,
+            ) = self._get_compact_attention_weights()
+
+            # ------------------------------------------------------
+            # QKV
+            # ------------------------------------------------------
+
+            qkv = self.qkv.forward_materialized(
+                x,
+                qkv_weight,
+            )
+
+        else:
+
+            # ------------------------------------------------------
+            # ORIGINAL QKV PATH
+            # ------------------------------------------------------
+
+            qkv_idx = self._qkv_indices(
+                head_dim,
+                key_dim,
+                x.device,
+            )
+
+            qkv = self.qkv.forward_indexed(
+                x,
+                out_idx=qkv_idx,
+            )
+
+        # ==========================================================
+        # Q / K / V processing - unchanged
+        # ==========================================================
+
+        per_head = (
+                2 * key_dim
+                + head_dim
+        )
+
+        expected_qkv = (
+                self.num_heads
+                * per_head
+        )
 
         if qkv.shape[1] != expected_qkv:
             raise RuntimeError(
@@ -1347,31 +1457,35 @@ class SlimAttention(nn.Module):
         )
 
         q, k, v = qkv.split(
-            [key_dim, key_dim, head_dim],
+            [
+                key_dim,
+                key_dim,
+                head_dim,
+            ],
             dim=2,
         )
 
-        # ---------------------------------------------------------
-        # 2. Attention
-        # ---------------------------------------------------------
-
-        scale = key_dim ** -0.5
-
-        attn = (
-            q.transpose(-2, -1) @ k
-        ) * scale
-
-        attn = attn.softmax(dim=-1)
-
-        out = (
-            v @ attn.transpose(-2, -1)
+        scale = (
+                key_dim ** -0.5
         )
 
-        # Compact representation:
-        #
-        # head0 active values
-        # head1 active values
-        # ...
+        attn = (
+                       q.transpose(-2, -1)
+                       @ k
+               ) * scale
+
+        attn = attn.softmax(
+            dim=-1
+        )
+
+        out = (
+                v
+                @ attn.transpose(
+            -2,
+            -1,
+        )
+        )
+
         out = out.reshape(
             B,
             dim,
@@ -1379,46 +1493,386 @@ class SlimAttention(nn.Module):
             W,
         )
 
-        # ---------------------------------------------------------
-        # 3. Positional encoding
-        # ---------------------------------------------------------
+        # ==========================================================
+        # POSITIONAL ENCODING
+        # ==========================================================
 
-        value_idx = self._value_indices(
-            head_dim,
-            x.device,
+        compact_v = v.reshape(
+            B,
+            dim,
+            H,
+            W,
         )
 
-        pe = self.pe.forward_indexed(
-            v.reshape(B, dim, H, W),
-            out_idx=value_idx,
-        )
+        if use_materialized_weights:
+
+            pe = (
+                self.pe.forward_materialized_depthwise(
+                    compact_v,
+                    pe_weight,
+                )
+            )
+
+        else:
+
+            value_idx = self._value_indices(
+                head_dim,
+                x.device,
+            )
+
+            pe = self.pe.forward_indexed(
+                compact_v,
+                out_idx=value_idx,
+            )
 
         out = out + pe
 
-        # ---------------------------------------------------------
-        # 4. Projection
-        # ---------------------------------------------------------
-        #
-        # Projection OUTPUT corresponds to the normal active prefix:
-        #
-        #     [0 ... dim_active]
-        #
-        # But its INPUT corresponds to the selected per-head
-        # V dimensions.
-        #
+        # ==========================================================
+        # PROJECTION
+        # ==========================================================
 
-        output_idx = torch.arange(
-            dim,
-            device=x.device,
-        )
+        if use_materialized_weights:
 
-        out = self.proj.forward_indexed(
-            out,
-            out_idx=output_idx,
-            in_idx=value_idx,
-        )
+            out = (
+                self.proj.forward_materialized(
+                    out,
+                    proj_weight,
+                )
+            )
+
+        else:
+
+            output_idx = torch.arange(
+                dim,
+                device=x.device,
+            )
+
+            out = self.proj.forward_indexed(
+                out,
+                out_idx=output_idx,
+                in_idx=value_idx,
+            )
 
         return out
+
+    def _init_compact_attention_weight_cache(self):
+        """
+        Lazily initialize 2B-5A cache metadata.
+
+        Required for older pickled checkpoints whose __init__()
+        is not rerun during torch.load().
+        """
+
+        if not hasattr(
+                self,
+                "_compact_attention_weight_cache_meta",
+        ):
+            self._compact_attention_weight_cache_meta = {}
+
+    def _build_compact_attention_weights(self):
+        """
+        Materialize the three special SlimAttention weights needed
+        by the current narrow width:
+
+            qkv  - non-contiguous output mapping
+            pe   - non-contiguous depthwise kernel mapping
+            proj - prefix outputs + non-contiguous inputs
+
+        These mappings depend only on width and architecture, so the
+        resulting compact weights can be reused across inference calls.
+        """
+
+        self._init_compact_attention_weight_cache()
+
+        width = float(
+            self.width_mult
+        )
+
+        if abs(width - 1.0) < 1e-6:
+            raise RuntimeError(
+                "Compact SlimAttention weights should not be built "
+                "at width 1.0. Optimization 2B-1 handles full width."
+            )
+
+        key = _width_key(
+            width,
+            self.widths,
+        )
+
+        dim, head_dim, key_dim = (
+            self._active_dims()
+        )
+
+        device = (
+            self.qkv.conv.weight.device
+        )
+
+        # ==========================================================
+        # Build the same mappings used by the original forward path.
+        # ==========================================================
+
+        qkv_idx = self._qkv_indices(
+            head_dim,
+            key_dim,
+            device,
+        )
+
+        value_idx = self._value_indices(
+            head_dim,
+            device,
+        )
+
+        # ==========================================================
+        # QKV
+        #
+        # Original:
+        #   non-contiguous output gather
+        #   ordinary compact input prefix
+        # ==========================================================
+
+        qkv_weight = (
+            self.qkv.conv.weight
+            .index_select(
+                0,
+                qkv_idx,
+            )
+        )
+
+        qkv_weight = qkv_weight[
+            :,
+            :dim,
+            :,
+            :,
+        ]
+
+        # ==========================================================
+        # Positional encoding
+        #
+        # Depthwise: one selected kernel for every selected V channel.
+        # ==========================================================
+
+        pe_weight = (
+            self.pe.conv.weight
+            .index_select(
+                0,
+                value_idx,
+            )
+        )
+
+        # ==========================================================
+        # Projection
+        #
+        # Output is normal active prefix.
+        # Input corresponds to the per-head active V mapping.
+        # ==========================================================
+
+        proj_weight = self.proj.conv.weight[
+            :dim,
+            :,
+            :,
+            :,
+        ]
+
+        proj_weight = (
+            proj_weight.index_select(
+                1,
+                value_idx,
+            )
+        )
+
+        # ==========================================================
+        # Make independent contiguous inference buffers.
+        # ==========================================================
+
+        qkv_weight = (
+            qkv_weight
+            .detach()
+            .contiguous()
+            .clone()
+        )
+
+        pe_weight = (
+            pe_weight
+            .detach()
+            .contiguous()
+            .clone()
+        )
+
+        proj_weight = (
+            proj_weight
+            .detach()
+            .contiguous()
+            .clone()
+        )
+
+        qkv_name = (
+            f"_cached_attention_qkv_weight_{key}"
+        )
+
+        pe_name = (
+            f"_cached_attention_pe_weight_{key}"
+        )
+
+        proj_name = (
+            f"_cached_attention_proj_weight_{key}"
+        )
+
+        buffers = (
+            (qkv_name, qkv_weight),
+            (pe_name, pe_weight),
+            (proj_name, proj_weight),
+        )
+
+        for name, weight in buffers:
+
+            if name in self._buffers:
+                self._buffers[name] = weight
+
+            else:
+                self.register_buffer(
+                    name,
+                    weight,
+                    persistent=False,
+                )
+
+        self._compact_attention_weight_cache_meta[
+            key
+        ] = {
+            "qkv_name": qkv_name,
+            "pe_name": pe_name,
+            "proj_name": proj_name,
+
+            "qkv_version":
+                self.qkv.conv.weight._version,
+
+            "pe_version":
+                self.pe.conv.weight._version,
+
+            "proj_version":
+                self.proj.conv.weight._version,
+
+            "dim":
+                int(dim),
+
+            "head_dim":
+                int(head_dim),
+
+            "key_dim":
+                int(key_dim),
+        }
+
+        return (
+            getattr(
+                self,
+                qkv_name,
+            ),
+            getattr(
+                self,
+                pe_name,
+            ),
+            getattr(
+                self,
+                proj_name,
+            ),
+        )
+
+    def _get_compact_attention_weights(self):
+        """
+        Return valid cached weights for the active width.
+
+        Rebuild if any underlying full-width convolution parameter
+        changed.
+        """
+
+        self._init_compact_attention_weight_cache()
+
+        width = float(
+            self.width_mult
+        )
+
+        key = _width_key(
+            width,
+            self.widths,
+        )
+
+        dim, head_dim, key_dim = (
+            self._active_dims()
+        )
+
+        meta = (
+            self._compact_attention_weight_cache_meta.get(
+                key
+            )
+        )
+
+        cache_valid = (
+                meta is not None
+
+                and meta["qkv_name"] in self._buffers
+                and meta["pe_name"] in self._buffers
+                and meta["proj_name"] in self._buffers
+
+                and meta["qkv_version"]
+                == self.qkv.conv.weight._version
+
+                and meta["pe_version"]
+                == self.pe.conv.weight._version
+
+                and meta["proj_version"]
+                == self.proj.conv.weight._version
+
+                and meta["dim"]
+                == int(dim)
+
+                and meta["head_dim"]
+                == int(head_dim)
+
+                and meta["key_dim"]
+                == int(key_dim)
+        )
+
+        if not cache_valid:
+            return (
+                self._build_compact_attention_weights()
+            )
+
+        return (
+            getattr(
+                self,
+                meta["qkv_name"],
+            ),
+            getattr(
+                self,
+                meta["pe_name"],
+            ),
+            getattr(
+                self,
+                meta["proj_name"],
+            ),
+        )
+
+    def set_compact_attention_weight_cache(
+            self,
+            enabled: bool,
+    ):
+        """
+        Enable/disable Optimization 2B-5A.
+
+        ON:
+            narrow-width eval inference reuses materialized
+            qkv / pe / proj weights.
+
+        OFF:
+            reproduce the existing SlimAttention indexed path.
+
+        Training and width 1.0 always follow the original path.
+        """
+
+        self._use_compact_attention_weight_cache = bool(
+            enabled
+        )
+
+        return self
 
 class SlimPSABlock(nn.Module):
     def __init__(
