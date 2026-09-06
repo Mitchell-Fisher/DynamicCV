@@ -2409,6 +2409,11 @@ class SlimC3k(nn.Module):
                 for _ in range(n)
             )
         )
+        # At narrow widths, cache the fully materialized cv3 weight so
+        # the output-prefix and grouped/non-contiguous input selections
+        # are not repeated every inference.
+        self._use_compact_cv3_weight_cache = True
+        self._compact_cv3_weight_cache_meta = {}
 
     def set_width(self, width: float):
 
@@ -2475,6 +2480,43 @@ class SlimC3k(nn.Module):
                 x.device,
             )
 
+        # ==============================================================
+        # OPTIMIZATION 2B-4
+        # ==============================================================
+
+        use_compact_cache = getattr(
+            self,
+            "_use_compact_cv3_weight_cache",
+            True,
+        )
+
+        use_materialized_weight = (
+                use_compact_cache
+                and not self.training
+                and abs(
+            self.cv3.width_mult - 1.0
+        ) >= 1e-6
+        )
+
+        if use_materialized_weight:
+            weight = (
+                self._get_compact_cv3_weight(
+                    in_idx
+                )
+            )
+
+            return self.cv3.forward_materialized(
+                cat,
+                weight,
+            )
+
+        # --------------------------------------------------------------
+        # Original path:
+        #   - training
+        #   - full width
+        #   - controlled A/B with 2B-4 disabled
+        # --------------------------------------------------------------
+
         out_idx = torch.arange(
             self.cv3.active_out(),
             device=x.device,
@@ -2528,6 +2570,223 @@ class SlimC3k(nn.Module):
         self._use_cached_group_idx = bool(
             enabled
         )
+        return self
+
+    def _init_compact_cv3_weight_cache(self):
+        """
+        Lazily initialize Optimization 2B-4 metadata.
+
+        Required for older serialized checkpoints whose current
+        __init__() is not rerun when torch.load() restores the module.
+        """
+
+        if not hasattr(
+                self,
+                "_compact_cv3_weight_cache_meta",
+        ):
+            self._compact_cv3_weight_cache_meta = {}
+
+    def _build_compact_cv3_weight(
+            self,
+            in_idx,
+    ):
+        """
+        Materialize the complete narrow-width SlimC3k.cv3 weight.
+
+        Existing runtime path:
+
+            full cv3 weight
+                -> output prefix index_select
+                -> grouped/non-contiguous input index_select
+                -> convolution
+
+        Optimization 2B-4 performs the selection once and caches the
+        final compact tensor.
+        """
+
+        self._init_compact_cv3_weight_cache()
+
+        width = float(
+            self.cv3.width_mult
+        )
+
+        if abs(width - 1.0) < 1e-6:
+            raise RuntimeError(
+                "SlimC3k compact cv3 weight should not be built "
+                "at width 1.0. Optimization 2B-1 handles the "
+                "full-width path."
+            )
+
+        widths = tuple(
+            self.cv3.bn.widths
+        )
+
+        key = _width_key(
+            width,
+            widths,
+        )
+
+        buffer_name = (
+            f"_cached_c3k_cv3_weight_{key}"
+        )
+
+        device = (
+            self.cv3.conv.weight.device
+        )
+
+        in_idx = torch.as_tensor(
+            in_idx,
+            device=device,
+            dtype=torch.long,
+        )
+
+        # ----------------------------------------------------------
+        # Output mapping is an active contiguous prefix.
+        # ----------------------------------------------------------
+
+        cout = self.cv3.active_out()
+
+        weight = self.cv3.conv.weight[
+            :cout,
+            :,
+            :,
+            :,
+        ]
+
+        # ----------------------------------------------------------
+        # Input corresponds to:
+        #
+        #   [active branch A channels,
+        #    active branch B channels]
+        #
+        # inside the full-width two-group concatenation.
+        # This is non-contiguous at narrow widths.
+        # ----------------------------------------------------------
+
+        weight = weight.index_select(
+            1,
+            in_idx,
+        )
+
+        # Own an inference-only compact tensor.
+        weight = (
+            weight
+            .detach()
+            .contiguous()
+            .clone()
+        )
+
+        if buffer_name in self._buffers:
+
+            self._buffers[
+                buffer_name
+            ] = weight
+
+        else:
+
+            self.register_buffer(
+                buffer_name,
+                weight,
+                persistent=False,
+            )
+
+        self._compact_cv3_weight_cache_meta[
+            key
+        ] = {
+            "buffer_name": buffer_name,
+
+            "weight_version":
+                self.cv3.conv.weight._version,
+
+            "in_channels":
+                int(len(in_idx)),
+
+            "out_channels":
+                int(cout),
+        }
+
+        return getattr(
+            self,
+            buffer_name,
+        )
+
+    def _get_compact_cv3_weight(
+            self,
+            in_idx,
+    ):
+        """
+        Return a valid cached compact cv3 weight for the current width.
+
+        Rebuild automatically if the underlying full-width parameter
+        has changed.
+        """
+
+        self._init_compact_cv3_weight_cache()
+
+        width = float(
+            self.cv3.width_mult
+        )
+
+        widths = tuple(
+            self.cv3.bn.widths
+        )
+
+        key = _width_key(
+            width,
+            widths,
+        )
+
+        meta = (
+            self._compact_cv3_weight_cache_meta.get(
+                key
+            )
+        )
+
+        cout = self.cv3.active_out()
+
+        cache_valid = (
+                meta is not None
+                and meta["buffer_name"] in self._buffers
+                and meta["weight_version"]
+                == self.cv3.conv.weight._version
+                and meta["in_channels"]
+                == int(len(in_idx))
+                and meta["out_channels"]
+                == int(cout)
+        )
+
+        if not cache_valid:
+            return self._build_compact_cv3_weight(
+                in_idx
+            )
+
+        return getattr(
+            self,
+            meta["buffer_name"],
+        )
+
+    def set_compact_cv3_weight_cache(
+            self,
+            enabled: bool,
+    ):
+        """
+        Enable/disable Optimization 2B-4.
+
+        enabled=True:
+            Narrow-width eval inference reuses a completely
+            materialized SlimC3k.cv3 convolution weight.
+
+        enabled=False:
+            Reproduce the existing forward_indexed() path.
+
+        Width 1.0 remains handled by Optimization 2B-1.
+        Training always uses the original parameter path.
+        """
+
+        self._use_compact_cv3_weight_cache = bool(
+            enabled
+        )
+
         return self
 
 class SlimConcat(nn.Module):
