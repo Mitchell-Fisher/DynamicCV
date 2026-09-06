@@ -328,6 +328,7 @@ class SlimConv(nn.Module):
 
         self._use_cached_out_idx = True
         self._use_prefix_slicing = True
+        self._use_full_width_fastpath = True
 
         self._build_out_idx_cache()
 
@@ -614,12 +615,76 @@ class SlimConv(nn.Module):
 
     def forward_indexed(self, x, out_idx, in_idx=None):
         """
-        Run this convolution using selected channels from the full-width weights.
+        Run this convolution using selected channels from the
+        full-width weights.
 
-        x is assumed to already contain the active channels in compact form.
-        out_idx maps compact output channels -> full-width output channels.
-        in_idx maps compact input channels -> full-width input channels.
+        Optimization 2B-1:
+            At width 1.0, all special index mappings collapse to identity
+            mappings, so no weight selection is required.
         """
+
+        # ==========================================================
+        # OPTIMIZATION 2B-1: FULL-WIDTH IDENTITY FAST PATH
+        # ==========================================================
+
+        use_full_width_fastpath = getattr(
+            self,
+            "_use_full_width_fastpath",
+            True,
+        )
+
+        if (
+                use_full_width_fastpath
+                and abs(self.width_mult - 1.0) < 1e-6
+        ):
+            # At full width the compact tensor must contain every
+            # original input channel.
+            if x.shape[1] != self.conv.in_channels:
+                raise RuntimeError(
+                    f"Full-width SlimConv fast path received "
+                    f"{x.shape[1]} input channels, but convolution "
+                    f"expects {self.conv.in_channels}."
+                )
+
+            # Full-width BN should likewise expect the complete
+            # convolution output.
+            expected = self.bn.active_features()
+
+            if expected != self.conv.out_channels:
+                raise RuntimeError(
+                    f"Full-width SlimConv fast path has "
+                    f"{self.conv.out_channels} convolution outputs, "
+                    f"but BN expects {expected}."
+                )
+
+            # ------------------------------------------------------
+            # No index_select.
+            # No slicing.
+            # No temporary weight tensor.
+            #
+            # Use the original full-width convolution weights
+            # directly.
+            # ------------------------------------------------------
+
+            y = F.conv2d(
+                x,
+                self.conv.weight,
+                bias=None,
+                stride=self.conv.stride,
+                padding=self.conv.padding,
+                dilation=self.conv.dilation,
+                groups=self.conv.groups,
+            )
+
+            return self.act(
+                self.bn(y)
+            )
+
+        # ==========================================================
+        # EXISTING SLIMMABLE PATH
+        #
+        # Everything below remains unchanged.
+        # ==========================================================
 
         expected = self.bn.active_features()
 
@@ -631,40 +696,71 @@ class SlimConv(nn.Module):
 
         device = self.conv.weight.device
 
-        out_idx = torch.as_tensor(out_idx, device=device, dtype=torch.long)
+        out_idx = torch.as_tensor(
+            out_idx,
+            device=device,
+            dtype=torch.long,
+        )
 
         if self.conv.groups == 1:
-            weight = self.conv.weight.index_select(0, out_idx)
+
+            weight = self.conv.weight.index_select(
+                0,
+                out_idx,
+            )
 
             if in_idx is None:
+
                 # Ordinary prefix slimming.
-                weight = weight[:, :x.shape[1], :, :]
+                weight = weight[
+                    :,
+                    :x.shape[1],
+                    :,
+                    :,
+                ]
+
             else:
-                in_idx = torch.as_tensor(in_idx, device=device, dtype=torch.long)
+
+                in_idx = torch.as_tensor(
+                    in_idx,
+                    device=device,
+                    dtype=torch.long,
+                )
 
                 if len(in_idx) != x.shape[1]:
                     raise RuntimeError(
-                        f"in_idx has {len(in_idx)} channels but input has {x.shape[1]}"
+                        f"in_idx has {len(in_idx)} channels "
+                        f"but input has {x.shape[1]}"
                     )
 
-                weight = weight.index_select(1, in_idx)
+                weight = weight.index_select(
+                    1,
+                    in_idx,
+                )
 
             groups = 1
 
         elif self._is_depthwise():
+
             # For depthwise conv there is one kernel per input channel.
             if len(out_idx) != x.shape[1]:
                 raise RuntimeError(
-                    "Slim depthwise convolution requires one selected kernel "
-                    "per active input channel."
+                    "Slim depthwise convolution requires one selected "
+                    "kernel per active input channel."
                 )
 
-            weight = self.conv.weight.index_select(0, out_idx)
+            weight = self.conv.weight.index_select(
+                0,
+                out_idx,
+            )
+
             groups = x.shape[1]
 
         else:
+
             raise RuntimeError(
-                "SlimConv currently supports groups=1 or depthwise convolution only. "
+                "SlimConv currently supports groups=1 or "
+                "depthwise convolution only. "
                 f"Got groups={self.conv.groups}."
             )
 
@@ -678,7 +774,9 @@ class SlimConv(nn.Module):
             groups=groups,
         )
 
-        return self.act(self.bn(y))
+        return self.act(
+            self.bn(y)
+        )
 
     def set_cached_indices(self, enabled: bool):
         """
@@ -710,6 +808,30 @@ class SlimConv(nn.Module):
         """
 
         self._use_prefix_slicing = bool(
+            enabled
+        )
+
+        return self
+
+    def set_full_width_fastpath(
+            self,
+            enabled: bool,
+    ):
+        """
+        Enable/disable Optimization 2B-1.
+
+        enabled=True:
+            At width 1.0, forward_indexed() bypasses all channel
+            selection and uses the original full convolution weight
+            directly.
+
+        enabled=False:
+            Reproduce the existing indexed full-width behavior.
+
+        Narrow widths are unaffected in either mode.
+        """
+
+        self._use_full_width_fastpath = bool(
             enabled
         )
 
