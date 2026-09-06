@@ -327,6 +327,7 @@ class SlimConv(nn.Module):
         )
 
         self._use_cached_out_idx = True
+        self._use_prefix_slicing = True
 
         self._build_out_idx_cache()
 
@@ -402,7 +403,149 @@ class SlimConv(nn.Module):
             self.width_mult,
         )
 
+    def _forward_prefix(self, x):
+        """
+        Fast path for ordinary SlimConv.forward() calls.
+
+        Both input and output channels are known to be compact
+        contiguous prefixes, so weight slicing can be used instead
+        of index_select.
+
+        This method is NOT used by forward_indexed(), because those
+        callers may use grouped or otherwise non-contiguous mappings.
+        """
+
+        expected = self.bn.active_features()
+
+        # ----------------------------------------------------------
+        # Standard convolution: groups == 1
+        # ----------------------------------------------------------
+
+        if self.conv.groups == 1:
+
+            cout = self.active_out()
+            cin = x.shape[1]
+
+            if cout != expected:
+                raise RuntimeError(
+                    f"SlimConv prefix path selected {cout} output channels, "
+                    f"but BN for width {self.width_mult} expects {expected}."
+                )
+
+            if cin > self.conv.in_channels:
+                raise RuntimeError(
+                    f"SlimConv received {cin} input channels, "
+                    f"but full-width convolution has only "
+                    f"{self.conv.in_channels}."
+                )
+
+            # ------------------------------------------------------
+            # Optimization 2A-1
+            #
+            # OLD:
+            #
+            # weight = self.conv.weight.index_select(0, out_idx)
+            # weight = weight[:, :cin, :, :]
+            #
+            # NEW:
+            #
+            # Direct contiguous-prefix view into the original weight.
+            # ------------------------------------------------------
+
+            weight = self.conv.weight[
+                :cout,
+                :cin,
+                :,
+                :,
+            ]
+
+            groups = 1
+
+        # ----------------------------------------------------------
+        # Depthwise convolution
+        # ----------------------------------------------------------
+
+        elif self._is_depthwise():
+
+            cout = x.shape[1]
+
+            if cout != expected:
+                raise RuntimeError(
+                    f"Slim depthwise convolution received {cout} "
+                    f"active channels, but BN for width "
+                    f"{self.width_mult} expects {expected}."
+                )
+
+            if cout > self.conv.out_channels:
+                raise RuntimeError(
+                    f"Slim depthwise convolution requested {cout} kernels, "
+                    f"but only {self.conv.out_channels} exist."
+                )
+
+            # One kernel per active input channel.
+            #
+            # OLD:
+            # weight = self.conv.weight.index_select(0, out_idx)
+            #
+            # NEW:
+            # contiguous prefix slice.
+            weight = self.conv.weight[
+                :cout,
+                :,
+                :,
+                :,
+            ]
+
+            groups = cout
+
+        else:
+
+            raise RuntimeError(
+                "SlimConv currently supports groups=1 or "
+                "depthwise convolution only. "
+                f"Got groups={self.conv.groups}."
+            )
+
+        y = F.conv2d(
+            x,
+            weight,
+            bias=None,
+            stride=self.conv.stride,
+            padding=self.conv.padding,
+            dilation=self.conv.dilation,
+            groups=groups,
+        )
+
+        return self.act(
+            self.bn(y)
+        )
+
     def forward(self, x):
+
+        # ==========================================================
+        # OPTIMIZATION 2A-1
+        #
+        # Ordinary SlimConv.forward() always represents compact
+        # contiguous input/output prefixes.
+        #
+        # Therefore we do not need index_select at all.
+        # ==========================================================
+
+        use_prefix_slicing = getattr(
+            self,
+            "_use_prefix_slicing",
+            True,
+        )
+
+        if use_prefix_slicing:
+            return self._forward_prefix(x)
+
+        # ==========================================================
+        # BASELINE PATH
+        #
+        # Keep the current 1A implementation intact so we can perform
+        # a controlled A/B comparison.
+        # ==========================================================
 
         use_cache = getattr(
             self,
@@ -411,12 +554,11 @@ class SlimConv(nn.Module):
         )
 
         # ----------------------------------------------------------
-        # BASELINE MODE:
-        # Original implementation.
-        #
-        # Reconstruct the output prefix on every forward.
+        # Original pre-1A mode.
         # ----------------------------------------------------------
+
         if not use_cache:
+
             cout = self.active_out()
 
             if self._is_depthwise():
@@ -434,12 +576,14 @@ class SlimConv(nn.Module):
             )
 
         # ----------------------------------------------------------
-        # OPTIMIZED MODE:
-        # Reuse cached prefix indices.
+        # Optimization 1A mode:
+        # cached output-prefix index tensor.
         # ----------------------------------------------------------
 
-        # Backward compatibility for old serialized checkpoints.
-        if not hasattr(self, "_out_idx_names"):
+        if not hasattr(
+                self,
+                "_out_idx_names",
+        ):
             self._build_out_idx_cache()
 
         out_idx = getattr(
@@ -447,8 +591,6 @@ class SlimConv(nn.Module):
             self._active_out_idx_name,
         )
 
-        # Preserve old depthwise behavior if an unexpected
-        # channel count reaches the layer.
         if (
                 self._is_depthwise()
                 and out_idx.numel() != x.shape[1]
@@ -550,6 +692,27 @@ class SlimConv(nn.Module):
             torch.arange() every forward.
         """
         self._use_cached_out_idx = bool(enabled)
+        return self
+
+    def set_prefix_slicing(
+            self,
+            enabled: bool,
+    ):
+        """
+        Enable/disable Optimization 2A-1.
+
+        enabled=True:
+            Ordinary SlimConv.forward() uses contiguous weight slices.
+
+        enabled=False:
+            Ordinary SlimConv.forward() uses the existing
+            cached-index + forward_indexed() implementation.
+        """
+
+        self._use_prefix_slicing = bool(
+            enabled
+        )
+
         return self
 
 class SlimPredConv(nn.Conv2d):
