@@ -136,6 +136,116 @@ def _group_prefix_indices(
         device,
     )
 
+def _build_group_prefix_cache(
+    module,
+    cache_attr,
+    buffer_prefix,
+    group_max,
+    num_groups,
+    widths,
+    device,
+):
+    """
+    Precompute grouped-prefix channel-index tensors for all
+    supported widths.
+
+    These index mappings depend only on the architecture and width,
+    not on the input image, so they can safely be reused.
+
+    persistent=False keeps them out of state_dict().
+    """
+
+    existing = getattr(
+        module,
+        cache_attr,
+        None,
+    )
+
+    # Cache already exists.
+    if existing is not None:
+        return existing
+
+    names = {}
+
+    for width in widths:
+
+        key = _width_key(
+            width,
+            widths,
+        )
+
+        active_c = _active(
+            group_max,
+            width,
+        )
+
+        buffer_name = (
+            f"_{buffer_prefix}_{key}"
+        )
+
+        # Support old serialized checkpoints that do not yet
+        # contain these buffers.
+        if buffer_name not in module._buffers:
+
+            module.register_buffer(
+                buffer_name,
+                _group_prefix_indices(
+                    group_max,
+                    active_c,
+                    num_groups,
+                    device,
+                ),
+                persistent=False,
+            )
+
+        names[key] = buffer_name
+
+    setattr(
+        module,
+        cache_attr,
+        names,
+    )
+
+    return names
+
+
+def _select_cached_group_prefix(
+    module,
+    cache_attr,
+    buffer_prefix,
+    active_attr,
+    group_max,
+    num_groups,
+    width,
+    widths,
+    device,
+):
+    """
+    Select the precomputed grouped-prefix index tensor for the
+    requested width.
+    """
+
+    names = _build_group_prefix_cache(
+        module=module,
+        cache_attr=cache_attr,
+        buffer_prefix=buffer_prefix,
+        group_max=group_max,
+        num_groups=num_groups,
+        widths=widths,
+        device=device,
+    )
+
+    key = _width_key(
+        width,
+        widths,
+    )
+
+    setattr(
+        module,
+        active_attr,
+        names[key],
+    )
+
 class SwitchableBN2d(nn.BatchNorm2d):
     def __init__(self, c_max, widths=None):
         super().__init__(
@@ -499,8 +609,22 @@ class SlimC2f(nn.Module):
         )
 
     def set_width(self, width: float):
+
+        # Old serialized checkpoints won't have these new cache
+        # attributes because __init__ is not rerun during torch.load().
+        if not hasattr(
+                self,
+                "_cv1_group_idx_names",
+        ):
+            self._build_group_idx_cache()
+
+        self._select_group_idx_cache(
+            width
+        )
+
         self.cv1.set_width(width)
         self.cv2.set_width(width)
+
         for m in self.m:
             if hasattr(m, "set_width"):
                 m.set_width(width)
@@ -515,12 +639,139 @@ class SlimC2f(nn.Module):
 
         active_c = _active(self.c, self.cv1.width_mult)
 
-        cv1_idx = _group_prefix_indices(
-            self.c,
-            active_c,
-            2,
-            x.device,
+        use_group_cache = getattr(
+            self,
+            "_use_cached_group_idx",
+            True,
         )
+
+        if use_group_cache:
+
+            if not hasattr(
+                    self,
+                    "_active_cv1_group_idx_name",
+            ):
+                self._build_group_idx_cache()
+                self._select_group_idx_cache(
+                    self.cv1.width_mult
+                )
+
+            cv1_idx = getattr(
+                self,
+                self._active_cv1_group_idx_name,
+            )
+
+        else:
+            # Original implementation for A/B testing.
+            cv1_idx = _group_prefix_indices(
+                self.c,
+                active_c,
+                2,
+                x.device,
+            )
+
+        def _build_group_prefix_cache(
+                module,
+                cache_attr,
+                buffer_prefix,
+                group_max,
+                num_groups,
+                widths,
+                device,
+        ):
+            """
+            Build and register grouped-prefix index tensors for every
+            supported width.
+
+            The generated mappings depend only on:
+                - full group size
+                - active width
+                - number of groups
+
+            Therefore they can be generated once and reused for inference.
+
+            persistent=False keeps these derived tensors out of state_dict.
+            """
+
+            # Already built.
+            existing = getattr(module, cache_attr, None)
+            if existing is not None:
+                return existing
+
+            names = {}
+
+            for width in widths:
+                key = _width_key(width, widths)
+
+                active_c = _active(
+                    group_max,
+                    width,
+                )
+
+                buffer_name = (
+                    f"_{buffer_prefix}_{key}"
+                )
+
+                # Useful for backward compatibility if an object somehow
+                # already contains the buffer but not the lookup dictionary.
+                if buffer_name not in module._buffers:
+                    module.register_buffer(
+                        buffer_name,
+                        _group_prefix_indices(
+                            group_max,
+                            active_c,
+                            num_groups,
+                            device,
+                        ),
+                        persistent=False,
+                    )
+
+                names[key] = buffer_name
+
+            setattr(
+                module,
+                cache_attr,
+                names,
+            )
+
+            return names
+
+        def _select_cached_group_prefix(
+                module,
+                cache_attr,
+                buffer_prefix,
+                active_attr,
+                group_max,
+                num_groups,
+                width,
+                widths,
+                device,
+        ):
+            """
+            Ensure the cache exists and select the buffer corresponding
+            to the requested width.
+            """
+
+            names = _build_group_prefix_cache(
+                module=module,
+                cache_attr=cache_attr,
+                buffer_prefix=buffer_prefix,
+                group_max=group_max,
+                num_groups=num_groups,
+                widths=widths,
+                device=device,
+            )
+
+            key = _width_key(
+                width,
+                widths,
+            )
+
+            setattr(
+                module,
+                active_attr,
+                names[key],
+            )
 
         x = self.cv1.forward_indexed(
             x,
@@ -537,12 +788,20 @@ class SlimC2f(nn.Module):
 
         cat = torch.cat(y, dim=1)
 
-        cv2_in_idx = _group_prefix_indices(
-            self.c,
-            active_c,
-            len(y),
-            x.device,
-        )
+        if use_group_cache:
+
+            cv2_in_idx = getattr(
+                self,
+                self._active_cv2_group_idx_name,
+            )
+
+        else:
+            cv2_in_idx = _group_prefix_indices(
+                self.c,
+                active_c,
+                len(y),
+                x.device,
+            )
 
         out_idx = torch.arange(
             self.cv2.active_out(),
@@ -554,6 +813,80 @@ class SlimC2f(nn.Module):
             out_idx=out_idx,
             in_idx=cv2_in_idx,
         )
+
+    def _build_group_idx_cache(self):
+        """
+        Build the two grouped-prefix mappings used by C2f:
+
+        cv1:
+            2 logical groups
+
+        cv2 input:
+            2 + number of bottleneck outputs
+        """
+
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        device = self.cv1.conv.weight.device
+
+        _build_group_prefix_cache(
+            module=self,
+            cache_attr="_cv1_group_idx_names",
+            buffer_prefix="cached_c2f_cv1_group_idx",
+            group_max=self.c,
+            num_groups=2,
+            widths=widths,
+            device=device,
+        )
+
+        _build_group_prefix_cache(
+            module=self,
+            cache_attr="_cv2_group_idx_names",
+            buffer_prefix="cached_c2f_cv2_group_idx",
+            group_max=self.c,
+            num_groups=2 + len(self.m),
+            widths=widths,
+            device=device,
+        )
+
+    def _select_group_idx_cache(self, width):
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        device = self.cv1.conv.weight.device
+
+        _select_cached_group_prefix(
+            module=self,
+            cache_attr="_cv1_group_idx_names",
+            buffer_prefix="cached_c2f_cv1_group_idx",
+            active_attr="_active_cv1_group_idx_name",
+            group_max=self.c,
+            num_groups=2,
+            width=width,
+            widths=widths,
+            device=device,
+        )
+
+        _select_cached_group_prefix(
+            module=self,
+            cache_attr="_cv2_group_idx_names",
+            buffer_prefix="cached_c2f_cv2_group_idx",
+            active_attr="_active_cv2_group_idx_name",
+            group_max=self.c,
+            num_groups=2 + len(self.m),
+            width=width,
+            widths=widths,
+            device=device,
+        )
+
+    def set_cached_group_indices(self, enabled: bool):
+        self._use_cached_group_idx = bool(
+            enabled
+        )
+        return self
 
 class SlimAttention(nn.Module):
     """
@@ -930,16 +1263,56 @@ class SlimC3k2(SlimC2f):
         )
 
     def set_width(self, width: float):
+
         self.width_mult = float(width)
+
+        # ----------------------------------------------------------
+        # Optimization 1B-1:
+        #
+        # SlimC3k2 inherits SlimC2f.forward(), so it must also
+        # update the grouped-prefix cache used by that forward().
+        #
+        # Older serialized checkpoints will not contain the new
+        # cache attributes, so build them lazily if needed.
+        # ----------------------------------------------------------
+
+        if not hasattr(
+                self,
+                "_cv1_group_idx_names",
+        ):
+            self._build_group_idx_cache()
+
+        self._select_group_idx_cache(
+            width
+        )
+
+        # ----------------------------------------------------------
+        # Existing width propagation
+        # ----------------------------------------------------------
+
         self.cv1.set_width(width)
         self.cv2.set_width(width)
+
         for m in self.m:
-            if hasattr(m, "set_width"):
+
+            if hasattr(
+                    m,
+                    "set_width",
+            ):
                 m.set_width(width)
+
             else:
+
+                # Handles nn.Sequential containers.
                 for child in m:
-                    if hasattr(child, "set_width"):
+
+                    if hasattr(
+                            child,
+                            "set_width",
+                    ):
                         child.set_width(width)
+
+        return self
 
     def forward(self, x):
         return super().forward(x)
@@ -956,6 +1329,16 @@ class SlimSPPF(nn.Module):
         self.add = shortcut and c1 == c2
 
     def set_width(self, width: float):
+        if not hasattr(
+                self,
+                "_group_idx_names",
+        ):
+            self._build_group_idx_cache()
+
+        self._select_group_idx_cache(
+            width
+        )
+
         self.cv1.set_width(width)
         self.cv2.set_width(width)
 
@@ -973,12 +1356,36 @@ class SlimSPPF(nn.Module):
         # and correspond to separate full-width groups.
         active_c = y[0].shape[1]
 
-        in_idx = _group_prefix_indices(
-            self.c,
-            active_c,
-            len(y),
-            x.device,
+        use_group_cache = getattr(
+            self,
+            "_use_cached_group_idx",
+            True,
         )
+
+        if use_group_cache:
+
+            if not hasattr(
+                    self,
+                    "_active_group_idx_name",
+            ):
+                self._build_group_idx_cache()
+                self._select_group_idx_cache(
+                    self.cv1.width_mult
+                )
+
+            in_idx = getattr(
+                self,
+                self._active_group_idx_name,
+            )
+
+        else:
+
+            in_idx = _group_prefix_indices(
+                self.c,
+                active_c,
+                len(y),
+                x.device,
+            )
 
         out_idx = torch.arange(
             self.cv2.active_out(),
@@ -997,6 +1404,51 @@ class SlimSPPF(nn.Module):
             else out
         )
 
+    def _build_group_idx_cache(self):
+
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        device = self.cv1.conv.weight.device
+
+        _build_group_prefix_cache(
+            module=self,
+            cache_attr="_group_idx_names",
+            buffer_prefix="cached_sppf_group_idx",
+            group_max=self.c,
+            num_groups=self.n + 1,
+            widths=widths,
+            device=device,
+        )
+
+
+    def _select_group_idx_cache(self, width):
+
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        device = self.cv1.conv.weight.device
+
+        _select_cached_group_prefix(
+            module=self,
+            cache_attr="_group_idx_names",
+            buffer_prefix="cached_sppf_group_idx",
+            active_attr="_active_group_idx_name",
+            group_max=self.c,
+            num_groups=self.n + 1,
+            width=width,
+            widths=widths,
+            device=device,
+        )
+
+
+    def set_cached_group_indices(self, enabled: bool):
+        self._use_cached_group_idx = bool(
+            enabled
+        )
+        return self
 
 class SlimC2PSA(nn.Module):
     def __init__(self, c1, c2, n=1, e=0.5):
@@ -1021,6 +1473,17 @@ class SlimC2PSA(nn.Module):
         )
 
     def set_width(self, width):
+
+        if not hasattr(
+                self,
+                "_group_idx_names",
+        ):
+            self._build_group_idx_cache()
+
+        self._select_group_idx_cache(
+            width
+        )
+
         self.cv1.set_width(width)
         self.cv2.set_width(width)
 
@@ -1030,12 +1493,38 @@ class SlimC2PSA(nn.Module):
     def forward(self, x):
         active_c = _active(self.c, self.cv1.width_mult)
 
-        split_idx = _group_prefix_indices(
-            self.c,
-            active_c,
-            2,
-            x.device,
+        use_group_cache = getattr(
+            self,
+            "_use_cached_group_idx",
+            True,
         )
+
+        if use_group_cache:
+
+            if not hasattr(
+                    self,
+                    "_active_group_idx_name",
+            ):
+                self._build_group_idx_cache()
+                self._select_group_idx_cache(
+                    self.cv1.width_mult
+                )
+
+            group_idx = getattr(
+                self,
+                self._active_group_idx_name,
+            )
+
+        else:
+
+            group_idx = _group_prefix_indices(
+                self.c,
+                active_c,
+                2,
+                x.device,
+            )
+
+        split_idx = group_idx
 
         x = self.cv1.forward_indexed(
             x,
@@ -1049,12 +1538,7 @@ class SlimC2PSA(nn.Module):
 
         x = torch.cat((a, b), dim=1)
 
-        in_idx = _group_prefix_indices(
-            self.c,
-            active_c,
-            2,
-            x.device,
-        )
+        in_idx = group_idx
 
         out_idx = torch.arange(
             self.cv2.active_out(),
@@ -1067,6 +1551,47 @@ class SlimC2PSA(nn.Module):
             in_idx=in_idx,
         )
 
+    def _build_group_idx_cache(self):
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        device = self.cv1.conv.weight.device
+
+        _build_group_prefix_cache(
+            module=self,
+            cache_attr="_group_idx_names",
+            buffer_prefix="cached_c2psa_group_idx",
+            group_max=self.c,
+            num_groups=2,
+            widths=widths,
+            device=device,
+        )
+
+    def _select_group_idx_cache(self, width):
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        device = self.cv1.conv.weight.device
+
+        _select_cached_group_prefix(
+            module=self,
+            cache_attr="_group_idx_names",
+            buffer_prefix="cached_c2psa_group_idx",
+            active_attr="_active_group_idx_name",
+            group_max=self.c,
+            num_groups=2,
+            width=width,
+            widths=widths,
+            device=device,
+        )
+
+    def set_cached_group_indices(self, enabled: bool):
+        self._use_cached_group_idx = bool(
+            enabled
+        )
+        return self
 
 class SlimDetect(Detect):
     """Detect head that accepts reduced-width feature maps but keeps fixed prediction output."""
@@ -1150,9 +1675,21 @@ class SlimC3k(nn.Module):
         )
 
     def set_width(self, width: float):
+
+        if not hasattr(
+                self,
+                "_group_idx_names",
+        ):
+            self._build_group_idx_cache()
+
+        self._select_group_idx_cache(
+            width
+        )
+
         self.cv1.set_width(width)
         self.cv2.set_width(width)
         self.cv3.set_width(width)
+
         for m in self.m:
             if hasattr(m, "set_width"):
                 m.set_width(width)
@@ -1171,12 +1708,36 @@ class SlimC3k(nn.Module):
 
         cat = torch.cat((a, b), dim=1)
 
-        in_idx = _group_prefix_indices(
-            self.c,
-            active_c,
-            2,
-            x.device,
+        use_group_cache = getattr(
+            self,
+            "_use_cached_group_idx",
+            True,
         )
+
+        if use_group_cache:
+
+            if not hasattr(
+                    self,
+                    "_active_group_idx_name",
+            ):
+                self._build_group_idx_cache()
+                self._select_group_idx_cache(
+                    self.cv1.width_mult
+                )
+
+            in_idx = getattr(
+                self,
+                self._active_group_idx_name,
+            )
+
+        else:
+
+            in_idx = _group_prefix_indices(
+                self.c,
+                active_c,
+                2,
+                x.device,
+            )
 
         out_idx = torch.arange(
             self.cv3.active_out(),
@@ -1188,6 +1749,50 @@ class SlimC3k(nn.Module):
             out_idx=out_idx,
             in_idx=in_idx,
         )
+
+    def _build_group_idx_cache(self):
+
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        device = self.cv1.conv.weight.device
+
+        _build_group_prefix_cache(
+            module=self,
+            cache_attr="_group_idx_names",
+            buffer_prefix="cached_c3k_group_idx",
+            group_max=self.c,
+            num_groups=2,
+            widths=widths,
+            device=device,
+        )
+
+    def _select_group_idx_cache(self, width):
+
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        device = self.cv1.conv.weight.device
+
+        _select_cached_group_prefix(
+            module=self,
+            cache_attr="_group_idx_names",
+            buffer_prefix="cached_c3k_group_idx",
+            active_attr="_active_group_idx_name",
+            group_max=self.c,
+            num_groups=2,
+            width=width,
+            widths=widths,
+            device=device,
+        )
+
+    def set_cached_group_indices(self, enabled: bool):
+        self._use_cached_group_idx = bool(
+            enabled
+        )
+        return self
 
 class SlimConcat(nn.Module):
     """
