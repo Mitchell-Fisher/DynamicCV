@@ -521,6 +521,59 @@ class SlimConv(nn.Module):
             self.bn(y)
         )
 
+    def forward_materialized(
+            self,
+            x,
+            weight,
+    ):
+        """
+        Run SlimConv using an already-materialized compact convolution
+        weight.
+
+        Optimization 2B-2 uses this for SlimC3k2 inference after the
+        required non-contiguous channel selections have been performed
+        once and cached.
+
+        This path is inference-oriented. The supplied weight must already
+        correspond exactly to the compact input/output channel layout.
+        """
+
+        if self.conv.groups != 1:
+            raise RuntimeError(
+                "forward_materialized() currently supports "
+                "groups=1 only."
+            )
+
+        expected = self.bn.active_features()
+
+        if weight.shape[0] != expected:
+            raise RuntimeError(
+                f"Materialized SlimConv weight has "
+                f"{weight.shape[0]} output channels, "
+                f"but BN expects {expected}."
+            )
+
+        if weight.shape[1] != x.shape[1]:
+            raise RuntimeError(
+                f"Materialized SlimConv weight has "
+                f"{weight.shape[1]} input channels, "
+                f"but input tensor has {x.shape[1]}."
+            )
+
+        y = F.conv2d(
+            x,
+            weight,
+            bias=None,
+            stride=self.conv.stride,
+            padding=self.conv.padding,
+            dilation=self.conv.dilation,
+            groups=1,
+        )
+
+        return self.act(
+            self.bn(y)
+        )
+
     def forward(self, x):
 
         # ==========================================================
@@ -1444,6 +1497,18 @@ class SlimC3k2(SlimC2f):
             for _ in range(n)
         )
 
+        # Optimization 2B-2:
+        #
+        # At narrow widths, cache the fully materialized compact cv1/cv2
+        # weights used by SlimC3k2 so that repeated inference does not
+        # perform the same index_select operations every image.
+        self._use_compact_weight_cache = True
+
+        # Metadata only. Actual tensor buffers are built lazily because
+        # old pickled checkpoints do not rerun __init__().
+        self._compact_weight_cache_meta = {}
+        self._compact_weight_buffer_names = set()
+
     def set_width(self, width: float):
 
         self.width_mult = float(width)
@@ -1497,8 +1562,497 @@ class SlimC3k2(SlimC2f):
         return self
 
     def forward(self, x):
-        return super().forward(x)
 
+        use_compact_cache = getattr(
+            self,
+            "_use_compact_weight_cache",
+            True,
+        )
+
+        # ==========================================================
+        # ORIGINAL PATH
+        #
+        # Keep training untouched.
+        #
+        # Keep full width on the existing SlimC2f path so that
+        # Optimization 2B-1 continues to handle width 1.0.
+        # ==========================================================
+
+        if (
+                not use_compact_cache
+                or self.training
+                or abs(self.cv1.width_mult - 1.0) < 1e-6
+        ):
+            return super().forward(x)
+
+        # ==========================================================
+        # OPTIMIZATION 2B-2
+        # ==========================================================
+
+        input_idx = None
+
+        # SlimConcat may supply:
+        #
+        #   (compact_tensor, full_width_input_indices)
+        #
+        if isinstance(
+                x,
+                tuple,
+        ):
+            x, input_idx = x
+
+        active_c = _active(
+            self.c,
+            self.cv1.width_mult,
+        )
+
+        # ----------------------------------------------------------
+        # Existing 1B-1 grouped mappings.
+        # ----------------------------------------------------------
+
+        use_group_cache = getattr(
+            self,
+            "_use_cached_group_idx",
+            True,
+        )
+
+        if use_group_cache:
+
+            if not hasattr(
+                    self,
+                    "_active_cv1_group_idx_name",
+            ):
+                self._build_group_idx_cache()
+
+                self._select_group_idx_cache(
+                    self.cv1.width_mult
+                )
+
+            cv1_idx = getattr(
+                self,
+                self._active_cv1_group_idx_name,
+            )
+
+            cv2_in_idx = getattr(
+                self,
+                self._active_cv2_group_idx_name,
+            )
+
+        else:
+
+            cv1_idx = _group_prefix_indices(
+                self.c,
+                active_c,
+                2,
+                x.device,
+            )
+
+            cv2_in_idx = _group_prefix_indices(
+                self.c,
+                active_c,
+                2 + len(self.m),
+                x.device,
+            )
+
+        # ----------------------------------------------------------
+        # Obtain the two already-compacted convolution weights.
+        #
+        # First inference at this width:
+        #     build + cache
+        #
+        # Later inference:
+        #     direct reuse
+        # ----------------------------------------------------------
+
+        cv1_weight, cv2_weight = (
+            self._get_compact_weights(
+                x=x,
+                input_idx=input_idx,
+                cv1_idx=cv1_idx,
+                cv2_in_idx=cv2_in_idx,
+            )
+        )
+
+        # ----------------------------------------------------------
+        # CV1 with no runtime weight selection.
+        # ----------------------------------------------------------
+
+        x = self.cv1.forward_materialized(
+            x,
+            cv1_weight,
+        )
+
+        y = [
+            x[
+                :,
+                :active_c,
+            ],
+            x[
+                :,
+                active_c:,
+            ],
+        ]
+
+        y.extend(
+            m(y[-1])
+            for m in self.m
+        )
+
+        cat = torch.cat(
+            y,
+            dim=1,
+        )
+
+        # ----------------------------------------------------------
+        # CV2 with no runtime output or input weight selection.
+        # ----------------------------------------------------------
+
+        return self.cv2.forward_materialized(
+            cat,
+            cv2_weight,
+        )
+
+    def _init_compact_weight_cache(self):
+        """
+        Lazily initialize Optimization 2B-2 metadata.
+
+        Required because older serialized YOLO checkpoints restore
+        SlimC3k2 objects without rerunning the current __init__().
+        """
+
+        if not hasattr(
+                self,
+                "_compact_weight_cache_meta",
+        ):
+            self._compact_weight_cache_meta = {}
+
+        if not hasattr(
+                self,
+                "_compact_weight_buffer_names",
+        ):
+            self._compact_weight_buffer_names = set()
+
+    def _store_compact_weight(
+            self,
+            name,
+            weight,
+    ):
+        """
+        Store a compact inference weight as a nonpersistent buffer.
+
+        Nonpersistent:
+            - follows .cpu(), .cuda(), .to(), .half(), etc.
+            - is not written into state_dict()
+        """
+
+        self._init_compact_weight_cache()
+
+        weight = (
+            weight
+            .detach()
+            .contiguous()
+            .clone()
+        )
+
+        if name in self._buffers:
+            self._buffers[name] = weight
+        else:
+            self.register_buffer(
+                name,
+                weight,
+                persistent=False,
+            )
+
+        self._compact_weight_buffer_names.add(
+            name
+        )
+
+    def _build_compact_weights(
+            self,
+            x,
+            input_idx,
+            cv1_idx,
+            cv2_in_idx,
+    ):
+        """
+        Build the complete compact cv1 and cv2 weights for the currently
+        active narrow width.
+
+        The exact index tensors already produced by the existing
+        architecture are used, so the cached weights represent exactly
+        the same channels as the normal forward_indexed() path.
+        """
+
+        self._init_compact_weight_cache()
+
+        width = float(
+            self.cv1.width_mult
+        )
+
+        if abs(width - 1.0) < 1e-6:
+            raise RuntimeError(
+                "2B-2 compact weights should not be built "
+                "for width 1.0. Optimization 2B-1 handles "
+                "the full-width case."
+            )
+
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        key = _width_key(
+            width,
+            widths,
+        )
+
+        cv1_name = (
+            f"_cached_c3k2_cv1_weight_{key}"
+        )
+
+        cv2_name = (
+            f"_cached_c3k2_cv2_weight_{key}"
+        )
+
+        # ==========================================================
+        # CV1
+        #
+        # Existing runtime path:
+        #
+        #   weight.index_select(0, cv1_idx)
+        #
+        # followed by either:
+        #
+        #   [:, :x.shape[1]]
+        #
+        # or:
+        #
+        #   index_select(1, input_idx)
+        #
+        # ==========================================================
+
+        cv1_idx = torch.as_tensor(
+            cv1_idx,
+            device=self.cv1.conv.weight.device,
+            dtype=torch.long,
+        )
+
+        cv1_weight = (
+            self.cv1.conv.weight.index_select(
+                0,
+                cv1_idx,
+            )
+        )
+
+        if input_idx is None:
+
+            cv1_weight = cv1_weight[
+                :,
+                :x.shape[1],
+                :,
+                :,
+            ]
+
+        else:
+
+            input_idx = torch.as_tensor(
+                input_idx,
+                device=self.cv1.conv.weight.device,
+                dtype=torch.long,
+            )
+
+            if len(input_idx) != x.shape[1]:
+                raise RuntimeError(
+                    f"SlimC3k2 input_idx has "
+                    f"{len(input_idx)} channels but "
+                    f"input has {x.shape[1]}."
+                )
+
+            cv1_weight = (
+                cv1_weight.index_select(
+                    1,
+                    input_idx,
+                )
+            )
+
+        # ==========================================================
+        # CV2
+        #
+        # Existing path selects a normal active output prefix, then
+        # selects the non-contiguous grouped input mapping.
+        #
+        # Because we are materializing the complete compact weight
+        # once, we can take the output prefix directly here and perform
+        # only the required input gather during cache construction.
+        # ==========================================================
+
+        cout = self.cv2.active_out()
+
+        cv2_in_idx = torch.as_tensor(
+            cv2_in_idx,
+            device=self.cv2.conv.weight.device,
+            dtype=torch.long,
+        )
+
+        cv2_weight = self.cv2.conv.weight[
+            :cout,
+            :,
+            :,
+            :,
+        ]
+
+        cv2_weight = (
+            cv2_weight.index_select(
+                1,
+                cv2_in_idx,
+            )
+        )
+
+        # ----------------------------------------------------------
+        # Store final compact tensors.
+        # ----------------------------------------------------------
+
+        self._store_compact_weight(
+            cv1_name,
+            cv1_weight,
+        )
+
+        self._store_compact_weight(
+            cv2_name,
+            cv2_weight,
+        )
+
+        # ----------------------------------------------------------
+        # Record the parameter versions that produced the cache.
+        #
+        # PyTorch Parameter._version changes when the underlying
+        # parameter is modified in-place, such as during training or
+        # state loading. This lets us rebuild stale inference caches.
+        # ----------------------------------------------------------
+
+        self._compact_weight_cache_meta[
+            key
+        ] = {
+            "cv1_name": cv1_name,
+            "cv2_name": cv2_name,
+
+            "cv1_version": (
+                self.cv1.conv.weight._version
+            ),
+
+            "cv2_version": (
+                self.cv2.conv.weight._version
+            ),
+
+            "cv1_in_channels": int(
+                x.shape[1]
+            ),
+
+            "cv2_in_channels": int(
+                len(cv2_in_idx)
+            ),
+        }
+
+        return (
+            getattr(
+                self,
+                cv1_name,
+            ),
+            getattr(
+                self,
+                cv2_name,
+            ),
+        )
+
+    def _get_compact_weights(
+            self,
+            x,
+            input_idx,
+            cv1_idx,
+            cv2_in_idx,
+    ):
+        """
+        Return valid cached compact weights for the active width,
+        rebuilding them if necessary.
+        """
+
+        self._init_compact_weight_cache()
+
+        width = float(
+            self.cv1.width_mult
+        )
+
+        widths = tuple(
+            self.cv1.bn.widths
+        )
+
+        key = _width_key(
+            width,
+            widths,
+        )
+
+        meta = (
+            self._compact_weight_cache_meta.get(
+                key
+            )
+        )
+
+        cache_valid = (
+                meta is not None
+                and meta["cv1_name"] in self._buffers
+                and meta["cv2_name"] in self._buffers
+                and meta["cv1_version"]
+                == self.cv1.conv.weight._version
+                and meta["cv2_version"]
+                == self.cv2.conv.weight._version
+                and meta["cv1_in_channels"]
+                == int(x.shape[1])
+                and meta["cv2_in_channels"]
+                == int(len(cv2_in_idx))
+        )
+
+        if not cache_valid:
+            return self._build_compact_weights(
+                x=x,
+                input_idx=input_idx,
+                cv1_idx=cv1_idx,
+                cv2_in_idx=cv2_in_idx,
+            )
+
+        return (
+            getattr(
+                self,
+                meta["cv1_name"],
+            ),
+            getattr(
+                self,
+                meta["cv2_name"],
+            ),
+        )
+
+    def set_compact_weight_cache(
+            self,
+            enabled: bool,
+    ):
+        """
+        Enable/disable Optimization 2B-2.
+
+        enabled=True:
+            At narrow widths in eval mode, SlimC3k2 uses
+            pre-materialized compact cv1/cv2 weights.
+
+        enabled=False:
+            SlimC3k2 follows the original inherited SlimC2f
+            forward_indexed() path.
+
+        Width 1.0 continues to use Optimization 2B-1.
+        Training always uses the original parameter path.
+        """
+
+        self._use_compact_weight_cache = bool(
+            enabled
+        )
+
+        return self
 
 class SlimSPPF(nn.Module):
     def __init__(self, c1: int, c2: int, k=5, n=3, shortcut=False):
