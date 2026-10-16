@@ -9,7 +9,7 @@ reg_max: 1
 scale: n
 
 # Runtime slimmable widths.
-slim_widths: [1.0, 0.875, 0.75, 0.625, 0.5]
+slim_widths: [1.0, 0.75, 0.5, 0.25]
 
 scales:
   n: [0.50, 0.25, 1024]
